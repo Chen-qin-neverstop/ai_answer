@@ -1,0 +1,24 @@
+# Local secrets (DO NOT COMMIT)
+config_local.h
+
+# Editor/IDE
+.vscode/
+.theia/
+
+# Arduino/Build artifacts
+build/
+*.bin
+*.elf
+*.map
+*.hex
+*.o
+*.a
+*.d
+
+# OS/Tools noise
+*.log
+.DS_Store
+Thumbs.db
+
+# Project data (kept local)
+data/
