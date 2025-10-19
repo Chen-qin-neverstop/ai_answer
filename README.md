@@ -149,26 +149,26 @@ const char* API_MODEL = "模型名称";
 
 **波特率**: 115200
 
-### 8. 语音输出模块 (Audio Output) - 预留接口
-**文件位置**: `AI_Answer.ino` - `speakText()`
-**功能描述**:
-- **当前状态**: 预留接口，未完全实现
-- **计划功能**: 
-  - 调用TTS（文字转语音）API
-  - 通过I2S接口驱动扬声器
-  - 播放AI分析结果
+### 8. 语音输出模块 (Audio Output)
+**文件位置**: `AI_Answer.ino` - `speakText()` / `requestAndPlayBaiduTTS()`
+**当前实现**:
+- 优先使用百度 TTS（直接从设备请求或使用本地配置的 access token）。
+- 支持 MP3 流在线播放，使用 I2S 输出和 `AudioGeneratorMP3` 解码。
+- 已添加详细串口日志用于诊断（见“诊断与日志”部分）。
 
-**可选方案**:
-1. **在线TTS**: 调用百度、阿里云、腾讯云TTS API
-2. **离线TTS**: 使用ESP32语音合成库
-3. **播放方案**: MAX98357A I2S功放 + 扬声器
-
-**I2S引脚预留** (待定):
+**如何配置百度 TTS（直接调用）**:
+1. 在 `config_local.h` 中设置以下项（用于设备端获取 token）:
 ```cpp
-#define I2S_DOUT  GPIO_NUM_XX
-#define I2S_BCLK  GPIO_NUM_XX
-#define I2S_LRC   GPIO_NUM_XX
+#define BAIDU_API_KEY "你的百度API Key"
+#define BAIDU_SECRET_KEY "你的百度Secret Key"
 ```
+2. 可选：为了快速测试，可以直接在 `config_local.h` 中设置一个临时的 `BAIDU_TTS_ACCESS_TOKEN`：
+```cpp
+#define BAIDU_TTS_ACCESS_TOKEN "临时token"
+```
+3. 生产环境推荐留空 `BAIDU_TTS_ACCESS_TOKEN`，设备会在运行时通过 `openapi.baidu.com/oauth/2.0/token` 获取并缓存 token。
+
+**注意**: 设备需能够访问 `openapi.baidu.com` (HTTPS，用于 token)，以及 `tsn.baidu.com` (HTTP，用于拉取 MP3 流)。如果网络受限，请参阅“代理/备用方案”。
 
 ### 9. 触发控制模块 (Trigger Control)
 **文件位置**: `AI_Answer.ino` - `checkTrigger()`
@@ -345,6 +345,28 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 - 尝试使用其他API端点
 - 增加HTTP超时时间
 
+### TTS/音频 诊断与常见问题
+
+- 在串口输出中查找关键日志关键词：
+  - "[Baidu] 获取 access_token"：表明设备尝试请求百度 token
+  - "access_token (已掩码)"：成功获取并缓存 token（日志会以掩码形式显示）
+  - "开始拉取音频流" / "HTTPS 流已打开" / "HTTP 流已打开"：表明音频流已建立
+  - "mp3->loop() 返回 false" 或 "MP3解码器初始化失败"：解码/播放问题，通常与内存或损坏的MP3流有关
+  - "🔍 [TTS] 进行 HTTPS 连接诊断..."：当 HTTPS 连接失败时，诊断工具会打印 DNS、TCP 测试与 HTTP 响应片段
+
+- 常见原因与解决：
+  - 如果看到 TCP 连接失败（诊断输出为 TCP 连接失败），说明网络或防火墙阻止了设备访问目标主机；请检查路由器或企业网络策略。
+  - 如果 token 请求返回非200并带有错误信息，请确认 `BAIDU_API_KEY` 与 `BAIDU_SECRET_KEY` 是否正确，并检查百度开放平台是否有调用限制。
+  - 若 MP3 解码报错且设备内存很低，尝试降低 JPEG/分辨率设置或启用 PSRAM（必须启用）。
+
+### 代理/备用方案（可选）
+
+如果设备无法直接访问百度或其他 TTS 提供商，可以在局域网或 VPS 上运行一个轻量代理（示例仓库中提供 `baidu_tts_proxy.py`）。代理的作用：
+- 由代理负责获取并缓存百度 token（避免在设备上处理 HTTPS/TLS 或频繁刷新 token）。
+- 代理从百度拉取音频并以普通 HTTP 返回给设备，降低设备的 TLS 需求。
+
+代理仅作为应急方案。当前实现优先直接在设备上请求百度（更安全）。
+
 #### 5. 图片过大无法编码
 **症状**: Base64编码失败或内存不足
 **解决方案**:
@@ -399,6 +421,11 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 ### v2.0.0 (2025-10-07)
 - ✅ 添加Base64图像编码
 - ✅ 集成视觉大模型API
+
+### v2.1.0 (2025-10-19)
+- ✅ 切换为优先直接调用百度TTS（支持设备端获取 token 或使用 config 中的临时 token）
+- ✅ 增强 TTS 与 token 相关的串口诊断日志（掩码显示 token、打印响应片段与内存信息）
+- ✅ 添加 HTTPS 连接诊断工具 `httpsDiagnostic` 用于快速定位 TLS/TCP 问题
 - ✅ 实现串口调试输出
 - ✅ 添加触发控制逻辑
 - ⏳ 预留语音输出接口
