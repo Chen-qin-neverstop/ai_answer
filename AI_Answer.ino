@@ -2,11 +2,80 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include "esp_http_server.h"
+#include "esp_err.h"
 #include "esp_timer.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
-#include "driver/i2s.h"  // I2S音频输出
+#include <math.h>
+#include <time.h>
+#include <AudioFileSourceHTTPStream.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutputI2S.h>
+#include "AudioHTTPSStream.h"
+
+// 简单的 HTTPS 诊断工具：打印响应码和前 200 字节（用于调试Edge TTS等服务）
+void httpsDiagnostic(const String &url) {
+  Serial.println(F("🔍 [TTS] 进行 HTTPS 连接诊断..."));
+  // 从 URL 中提取主机名
+  String host;
+  int idx = url.indexOf("//");
+  if (idx >= 0) {
+    int start = idx + 2;
+    int slash = url.indexOf('/', start);
+    if (slash > 0) host = url.substring(start, slash);
+    else host = url.substring(start);
+  } else {
+    Serial.println(F("✗ [Diag] 无法解析 URL 中的主机名"));
+    return;
+  }
+
+  IPAddress ip;
+  Serial.printf("↪ [Diag] 正在解析主机: %s\n", host.c_str());
+  if (WiFi.hostByName(host.c_str(), ip)) {
+    Serial.printf("↪ [Diag] DNS 解析成功: %s -> %s\n", host.c_str(), ip.toString().c_str());
+  } else {
+    Serial.printf("✗ [Diag] DNS 解析失败: %s\n", host.c_str());
+  }
+
+  // TCP 连接测试到 443
+  uint16_t port = 443;
+  Serial.printf("↪ [Diag] 尝试 TCP 连接到 %s:%d ...\n", host.c_str(), port);
+  WiFiClient tcpClient;
+  tcpClient.setTimeout(5);
+  bool connected = tcpClient.connect(host.c_str(), port);
+  if (connected) {
+    Serial.println(F("✓ [Diag] TCP 连接成功 (端口 443 开放)"));
+    tcpClient.stop();
+  } else {
+    Serial.println(F("✗ [Diag] TCP 连接失败（connection refused / timeout）"));
+  }
+
+  // 最后尝试 HTTPClient 请求以获取应用层信息
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.setUserAgent("ESP32-Diagnostic/1.0");
+  Serial.println(F("↪ [Diag] 使用 HTTPClient 发起请求以获取更多信息..."));
+  if (!http.begin(client, url)) {
+    Serial.println(F("✗ [Diag] HTTP begin 失败 (可能 TLS/底层无法建立连接)"));
+    return;
+  }
+  int code = http.GET();
+  Serial.printf("↪ [Diag] HTTP 响应码: %d\n", code);
+  if (code > 0) {
+    int len = http.getSize();
+    Serial.printf("↪ [Diag] Content-Length: %d\n", len);
+    String payload = http.getString();
+    Serial.print(F("↪ [Diag] 响应前200字节: "));
+    if (payload.length() > 200) payload = payload.substring(0, 200);
+    Serial.println(payload);
+  } else {
+    Serial.printf("✗ [Diag] HTTP 请求失败: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
 
 // ==================== 本地配置(密钥)加载 ====================
 // 优先包含本地未提交的 config_local.h；无则回退到示例 config_example.h
@@ -34,8 +103,8 @@ const char* OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const char* OPENAI_MODEL = "gpt-4-vision-preview";
 
 // ✅ 通义千问 Vision 配置 (OpenAI兼容模式,支持Base64!)
-const char* QWEN_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";  // ⚠️ 使用OpenAI兼容端点
-const char* QWEN_MODEL = "qwen-vl-plus";  // 或 qwen-vl-plus / qwen-vl-max-latest
+const char* QWEN_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+const char* QWEN_MODEL = "qwen-vl-plus";  // 可根据需要调整型号
 
 // 自定义API配置（如果使用其他兼容OpenAI格式的API）
 const char* CUSTOM_ENDPOINT = "https://your-custom-endpoint/v1/chat/completions";
@@ -44,54 +113,73 @@ const char* CUSTOM_MODEL = "your-model-name";
 // 提示词配置
 const char* VISION_PROMPT = "请详细描述这张图片中的内容，包括物体、场景、颜色等细节。用中文回答。";
 
-// ==================== I2S 音频输出配置 ====================
-// MAX98357A I2S 引脚定义 (修改避免与摄像头冲突)
-// ⚠️ 原GPIO 13/14/15与摄像头冲突,改用以下引脚:
-#define I2S_BCLK_PIN    21  // 位时钟 → MAX98357A BCLK
-#define I2S_LRC_PIN     42  // 帧时钟 → MAX98357A LRC  
-#define I2S_DOUT_PIN    41  // 数据输出 → MAX98357A DIN
-#define I2S_NUM         I2S_NUM_0  // 使用I2S端口0
+// ==================== TTS 提供商选择 ====================
+// 可选: "google" 谷歌翻译TTS, "edge" 微软Edge TTS, "baidu" 百度TTS
+const char* TTS_PROVIDER = "baidu";
 
-// 音频参数
-#define AUDIO_SAMPLE_RATE    16000  // TTS采样率16kHz
-#define AUDIO_BITS_PER_SAMPLE 16    // 16位音频
-#define AUDIO_CHANNELS        1     // 单声道
+// 百度TTS相关配置（建议放在config_local.h）
+#ifndef BAIDU_TTS_PROXY_URL
+#define BAIDU_TTS_PROXY_URL "http://192.168.1.100:3000/baidu_tts" // 示例: 你的本地/局域网代理地址
+#endif
+// 如果希望设备直接获取 token 并直连百度TTS，请在 config_local.h 中定义以下两项：
+// #define BAIDU_API_KEY "你的百度语音合成 API Key"
+// #define BAIDU_SECRET_KEY "你的百度语音合成 Secret Key"
+#ifndef BAIDU_API_KEY
+#define BAIDU_API_KEY ""
+#endif
+#ifndef BAIDU_SECRET_KEY
+#define BAIDU_SECRET_KEY ""
+#endif
+
+// Baidu token 缓存
+static String baidu_access_token = "";
+static unsigned long baidu_token_expires_ms = 0;
+
+// 可选代理: 如果设备无法直接访问外部TTS（网络/防火墙问题），
+// 可以在本地或VPS上运行一个简单的HTTP代理，将真实TTS请求由代理发出并返回音频。
+// 例: "http://192.168.1.100:3000/tts_proxy" 或 "http://your-vps:3000/tts_proxy"
+// 置为空字符串表示不使用代理。
+const char* TTS_PROXY_URL = "";
+
+// ==================== I2S 音频输出配置 ====================
+#define I2S_BCLK_PIN    21
+#define I2S_LRC_PIN     42
+#define I2S_DOUT_PIN    41
+#define I2S_NUM         I2S_NUM_0
+
+#define AUDIO_SAMPLE_RATE     16000
+#define AUDIO_BITS_PER_SAMPLE 16
+#define AUDIO_CHANNELS        1
 
 // 触发按钮配置
-#define TRIGGER_BUTTON_PIN 0  // GPIO0 - Boot按钮
+#define TRIGGER_BUTTON_PIN 0
 bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0; 
+unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;
 
-// 定时触发配置
-bool autoCapture = false;  // 是否启用定时自动拍照
-unsigned long autoCaptureInterval = 30000;  // 自动拍照间隔(毫秒) - 30秒
-unsigned long lastAutoCaptureTime = 0;
-
 // 果云ESP32-S3 CAM引脚定义
-#define PWDN_GPIO_NUM     -1
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM     15
-#define SIOD_GPIO_NUM     4
-#define SIOC_GPIO_NUM     5
+#define PWDN_GPIO_NUM  -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  15
+#define SIOD_GPIO_NUM  4
+#define SIOC_GPIO_NUM  5
 
-#define Y9_GPIO_NUM       16
-#define Y8_GPIO_NUM       17
-#define Y7_GPIO_NUM       18
-#define Y6_GPIO_NUM       12
-#define Y5_GPIO_NUM       10
-#define Y4_GPIO_NUM       8
-#define Y3_GPIO_NUM       9
-#define Y2_GPIO_NUM       11
-#define VSYNC_GPIO_NUM    6
-#define HREF_GPIO_NUM     7
-#define PCLK_GPIO_NUM     13
+#define Y9_GPIO_NUM    16
+#define Y8_GPIO_NUM    17
+#define Y7_GPIO_NUM    18
+#define Y6_GPIO_NUM    12
+#define Y5_GPIO_NUM    10
+#define Y4_GPIO_NUM    8
+#define Y3_GPIO_NUM    9
+#define Y2_GPIO_NUM    11
+#define VSYNC_GPIO_NUM 6
+#define HREF_GPIO_NUM  7
+#define PCLK_GPIO_NUM  13
 
-#define LED_GPIO_NUM      2  // 板载LED
+#define LED_GPIO_NUM   2
 
 httpd_handle_t camera_httpd = NULL;
 
-// 摄像头初始化
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -114,39 +202,32 @@ void setupCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;  // 使用最新帧模式
-  
-  // 使用较小的配置避免内存问题
-  config.frame_size = FRAMESIZE_VGA;    // 640x480
-  config.jpeg_quality = 10;              // 质量10-12较好
-  config.fb_count = 2;                   // 使用2个缓冲区
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.frame_size = FRAMESIZE_VGA;
+  config.jpeg_quality = 10;
+  config.fb_count = 2;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  
-  // 初始化摄像头
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("摄像头初始化失败，错误码: 0x%x\n", err);
-    Serial.println("请检查：");
-    Serial.println("1. Arduino IDE设置 Tools > PSRAM 必须启用");
-    Serial.println("2. 摄像头连接是否正确");
+    Serial.println("请检查摄像头连接及PSRAM配置");
     return;
   }
-  
-  Serial.println("摄像头初始化成功！");
-  
-  // 摄像头传感器设置
-  sensor_t * s = esp_camera_sensor_get();
-  if (s != NULL) {
+
+  Serial.println("摄像头初始化成功");
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (s != nullptr) {
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
-    s->set_special_effect(s, 0);
     s->set_whitebal(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_exposure_ctrl(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
-    s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 0);
-    s->set_gain_ctrl(s, 1);
     s->set_agc_gain(s, 0);
     s->set_gainceiling(s, (gainceiling_t)0);
     s->set_bpc(s, 0);
@@ -160,127 +241,84 @@ void setupCamera() {
   }
 }
 
-// HTTP处理函数 - 拍照（修复版本）
-static esp_err_t jpg_handler(httpd_req_t *req){
-  camera_fb_t * fb = NULL;
-  esp_err_t res = ESP_OK;
-  
-  Serial.println("收到拍照请求");
-  
-  // 获取摄像头帧
-  fb = esp_camera_fb_get();
+static esp_err_t jpg_handler(httpd_req_t* req) {
+  camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("获取图片失败");
     const char* error_msg = "Camera capture failed";
     httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, error_msg, strlen(error_msg));
-    return ESP_FAIL;
+    return httpd_resp_send(req, error_msg, strlen(error_msg));
   }
-  
-  Serial.printf("图片大小: %u bytes\n", fb->len);
-  
-  // 设置响应头
+
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  
-  // 分块发送，避免内存问题
-  size_t fb_len = fb->len;
-  const size_t chunk_size = 4096;  // 使用4KB块大小
-  size_t sent = 0;
-  
-  while (sent < fb_len) {
-    size_t to_send = (fb_len - sent > chunk_size) ? chunk_size : (fb_len - sent);
-    res = httpd_resp_send_chunk(req, (const char *)(fb->buf + sent), to_send);
+
+  const size_t chunk_size = 4096;
+  size_t offset = 0;
+  while (offset < fb->len) {
+    size_t to_send = fb->len - offset;
+    if (to_send > chunk_size) {
+      to_send = chunk_size;
+    }
+    esp_err_t res = httpd_resp_send_chunk(req, reinterpret_cast<const char*>(fb->buf + offset), to_send);
+    if (res != ESP_OK) {
+      esp_camera_fb_return(fb);
+      return res;
+    }
+    offset += to_send;
+    delay(1);
+  }
+
+  httpd_resp_send_chunk(req, NULL, 0);
+  esp_camera_fb_return(fb);
+  return ESP_OK;
+}
+
+static esp_err_t stream_handler(httpd_req_t* req) {
+  esp_err_t res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+  if (res != ESP_OK) {
+    return res;
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  while (true) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("获取视频帧失败");
+      return ESP_FAIL;
+    }
+
+    res = httpd_resp_send_chunk(req, "--frame\r\n", 9);
+    if (res == ESP_OK) {
+      char header[128];
+      int header_len = snprintf(header, sizeof(header),
+                                "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                                fb->len);
+      res = httpd_resp_send_chunk(req, header, header_len);
+    }
+
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, reinterpret_cast<const char*>(fb->buf), fb->len);
+    }
+
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, "\r\n", 2);
+    }
+
+    esp_camera_fb_return(fb);
+
     if (res != ESP_OK) {
       break;
     }
-    sent += to_send;
-    delay(1);  // 短暂延迟，让系统有时间处理其他任务
+    delay(1);
   }
-  
-  // 发送结束
-  httpd_resp_send_chunk(req, NULL, 0);
-  
-  // 释放帧缓冲
-  esp_camera_fb_return(fb);
-  
-  Serial.println("拍照完成");
+
   return res;
 }
 
-// HTTP处理函数 - 视频流（优化版本）
-static esp_err_t stream_handler(httpd_req_t *req){
-  camera_fb_t * fb = NULL;
-  esp_err_t res = ESP_OK;
-  char part_buf[128];
-  
-  Serial.println("开始视频流");
-  
-  res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
-  if(res != ESP_OK){
-    return res;
-  }
-  
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  httpd_resp_set_hdr(req, "X-Framerate", "60");
-  
-  while(true){
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("获取帧失败");
-      res = ESP_FAIL;
-      break;
-    }
-    
-    // 发送边界
-    if(res == ESP_OK){
-      res = httpd_resp_send_chunk(req, "--frame\r\n", 9);
-    }
-    
-    // 发送头部
-    if(res == ESP_OK){
-      size_t hlen = snprintf(part_buf, 128, 
-        "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", 
-        fb->len);
-      res = httpd_resp_send_chunk(req, part_buf, hlen);
-    }
-    
-    // 分块发送图片数据
-    if(res == ESP_OK){
-      size_t fb_len = fb->len;
-      const size_t chunk_size = 8192;  // 流传输用更大的块
-      size_t sent = 0;
-      
-      while (sent < fb_len && res == ESP_OK) {
-        size_t to_send = (fb_len - sent > chunk_size) ? chunk_size : (fb_len - sent);
-        res = httpd_resp_send_chunk(req, (const char *)(fb->buf + sent), to_send);
-        sent += to_send;
-        delay(1);  // 短暂延迟
-      }
-    }
-    
-    // 发送结束符
-    if(res == ESP_OK){
-      res = httpd_resp_send_chunk(req, "\r\n", 2);
-    }
-    
-    // 释放帧缓冲
-    esp_camera_fb_return(fb);
-    fb = NULL;
-    
-    if(res != ESP_OK){
-      Serial.println("流传输中断");
-      break;
-    }
-  }
-  
-  Serial.println("视频流结束");
-  return res;
-}
-
-// 网页界面
-static esp_err_t index_handler(httpd_req_t *req){
+static esp_err_t index_handler(httpd_req_t* req) {
   const char* html = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -290,7 +328,7 @@ static esp_err_t index_handler(httpd_req_t *req){
   <title>ESP32-S3 AI Vision</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { 
+    body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
@@ -300,8 +338,8 @@ static esp_err_t index_handler(httpd_req_t *req){
       max-width: 1200px;
       margin: 0 auto;
     }
-    h1 { 
-      color: white; 
+    h1 {
+      color: white;
       text-align: center;
       margin-bottom: 30px;
       font-size: 2.5em;
@@ -379,9 +417,9 @@ static esp_err_t index_handler(httpd_req_t *req){
       transform: translateY(0);
     }
     .btn-primary { background: #4CAF50; color: white; }
+    .btn-danger { background: #f44336; color: white; }
     .btn-secondary { background: #2196F3; color: white; }
     .btn-warning { background: #FF9800; color: white; }
-    .btn-danger { background: #f44336; color: white; }
     .btn-info { background: #00BCD4; color: white; }
     #status {
       text-align: center;
@@ -447,9 +485,8 @@ static esp_err_t index_handler(httpd_req_t *req){
 <body>
   <div class="container">
     <h1>📷 ESP32-S3 AI 视觉系统</h1>
-    
+
     <div class="grid">
-      <!-- 左侧：实时视频流 -->
       <div class="card">
         <h2>📹 实时画面</h2>
         <div id="stream-container">
@@ -462,8 +499,7 @@ static esp_err_t index_handler(httpd_req_t *req){
           <button class="btn-secondary" onclick="capture()">📸 拍照</button>
         </div>
       </div>
-      
-      <!-- 右侧：AI分析 -->
+
       <div class="card">
         <h2>🤖 AI 图像分析</h2>
         <div id="ai-image-container">
@@ -477,29 +513,27 @@ static esp_err_t index_handler(httpd_req_t *req){
         </div>
       </div>
     </div>
-    
-    <!-- AI分析结果 -->
+
     <div class="card">
       <h2>💬 分析结果</h2>
       <div id="ai-result">等待AI分析...</div>
     </div>
-    
-    <!-- 状态栏 -->
+
     <div id="status">系统就绪 - 点击按钮开始使用</div>
   </div>
-  
+
   <script>
     const streamImg = document.getElementById('stream');
     const aiImage = document.getElementById('ai-image');
     const status = document.getElementById('status');
     const aiResult = document.getElementById('ai-result');
     let streamActive = false;
-    
+
     function updateStatus(msg, type = '') {
       status.innerHTML = msg;
       status.className = type;
     }
-    
+
     function startStream() {
       if (!streamActive) {
         document.querySelector('#stream-container .placeholder').classList.add('hidden');
@@ -509,7 +543,7 @@ static esp_err_t index_handler(httpd_req_t *req){
         updateStatus('✅ 视频流运行中...', 'success');
       }
     }
-    
+
     function stopStream() {
       if (streamActive) {
         streamImg.src = '';
@@ -519,7 +553,7 @@ static esp_err_t index_handler(httpd_req_t *req){
         updateStatus('⏸ 视频流已停止');
       }
     }
-    
+
     function capture() {
       updateStatus('📸 正在拍照...', 'analyzing');
       fetch('/capture')
@@ -538,58 +572,43 @@ static esp_err_t index_handler(httpd_req_t *req){
           console.error('拍照错误:', err);
         });
     }
-    
-    // 美化AI输出文本：去除Markdown格式符号
+
     function beautifyAIText(text) {
       return text
-        // 移除加粗标记 **text**
         .replace(/\*\*(.+?)\*\*/g, '$1')
-        // 移除斜体标记 *text* 或 _text_
         .replace(/\*(.+?)\*/g, '$1')
         .replace(/_(.+?)_/g, '$1')
-        // 移除列表标记 - 或 * 开头
         .replace(/^[\-\*]\s+/gm, '• ')
-        // 移除数字列表的点号，保留数字
         .replace(/^(\d+)\.\s+/gm, '$1. ')
-        // 移除代码块标记 ```
         .replace(/```[\s\S]*?```/g, (match) => match.replace(/```/g, ''))
-        // 移除行内代码标记 `code`
         .replace(/`(.+?)`/g, '$1')
-        // 移除标题标记 # 
         .replace(/^#+\s+/gm, '')
-        // 清理多余的空行（保留最多2个连续换行）
         .replace(/\n{3,}/g, '\n\n')
-        // 去除行首行尾空格
         .trim();
     }
-    
+
     function aiAnalyze() {
-      // 更新状态
       updateStatus('<span class="loading"></span>🤖 AI正在分析图像，请稍候...（预计10-30秒）', 'analyzing');
       aiResult.innerHTML = '⏳ AI分析中...\n\n步骤：\n📷 正在拍摄图片...\n🔄 正在编码为Base64...\n🌐 正在调用AI API...\n💬 等待AI响应...\n✅ 准备显示结果...';
-      
-      // 隐藏旧图片
+
       aiImage.classList.add('hidden');
       document.querySelector('#ai-image-container .placeholder').classList.remove('hidden');
-      
+
       const startTime = Date.now();
-      
+
       fetch('/ai_analyze')
         .then(response => response.json())
         .then(data => {
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-          
+
           if (data.success) {
-            // 显示拍摄的图片
             document.querySelector('#ai-image-container .placeholder').classList.add('hidden');
             aiImage.src = 'data:image/jpeg;base64,' + data.image;
             aiImage.classList.remove('hidden');
-            
-            // 美化并显示AI分析结果
+
             const beautifiedResult = beautifyAIText(data.result);
             aiResult.innerHTML = '✅ 分析完成\n\n' + beautifiedResult + '\n\n⏱️ 耗时：' + elapsed + ' 秒';
             updateStatus('✅ AI分析完成！用时 ' + elapsed + ' 秒', 'success');
-            
             setTimeout(() => updateStatus('系统就绪'), 5000);
           } else {
             aiResult.innerHTML = '❌ 分析失败\n\n错误信息：' + data.error;
@@ -602,31 +621,30 @@ static esp_err_t index_handler(httpd_req_t *req){
           console.error('AI分析错误:', err);
         });
     }
-    
-        // 临时：前端触发测试蜂鸣
-        function testBeep() {
-          updateStatus('🔊 发送测试蜂鸣请求...');
-          fetch('/beep')
-            .then(res => res.json())
-            .then(data => {
-              if (data && data.success) {
-                updateStatus('🔊 蜂鸣播放成功', 'success');
-              } else {
-                updateStatus('❌ 蜂鸣播放失败', 'error');
-              }
-            })
-            .catch(err => {
-              updateStatus('❌ 蜂鸣请求失败', 'error');
-              console.error('beep请求错误:', err);
-            });
-        }
-    
-    // 初始化提示
+
+    function testBeep() {
+      updateStatus('🔊 发送测试蜂鸣请求...');
+      fetch('/beep')
+        .then(res => res.json())
+        .then(data => {
+          if (data && data.success) {
+            updateStatus('🔊 蜂鸣播放成功', 'success');
+          } else {
+            updateStatus('❌ 蜂鸣播放失败', 'error');
+          }
+        })
+        .catch(err => {
+          updateStatus('❌ 蜂鸣请求失败', 'error');
+          console.error('beep请求错误:', err);
+        });
+    }
+
     updateStatus('💡 提示：先点击"开始视频流"查看画面，然后点击"AI分析"识别图像');
   </script>
 </body>
 </html>
 )rawliteral";
+
   httpd_resp_set_type(req, "text/html");
   return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
@@ -802,221 +820,442 @@ void outputToSerial(String aiResponse) {
   Serial.println("══════════════════════════════════════\n");
 }
 
-// ==================== I2S 音频初始化 ====================
-void initI2S() {
-  Serial.println("🔊 初始化I2S音频输出...");
-  
-  // I2S配置
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = AUDIO_SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // MAX98357A单声道
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
-  };
-  
-  // I2S引脚配置
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_BCLK_PIN,
-    .ws_io_num = I2S_LRC_PIN,
-    .data_out_num = I2S_DOUT_PIN,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-  
-  // 安装I2S驱动
-  esp_err_t err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("❌ I2S驱动安装失败: %d\n", err);
-    return;
-  }
-  
-  // 设置引脚
-  err = i2s_set_pin(I2S_NUM, &pin_config);
-  if (err != ESP_OK) {
-    Serial.printf("❌ I2S引脚设置失败: %d\n", err);
-    return;
-  }
-  
-  // 清空DMA缓冲区
-  i2s_zero_dma_buffer(I2S_NUM);
-  
-  Serial.println("✓ I2S音频输出已初始化");
-  Serial.printf("  引脚: BCLK=%d, LRC=%d, DOUT=%d\n", I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
-  Serial.printf("  采样率: %d Hz\n", AUDIO_SAMPLE_RATE);
-}
-
-// 测试I2S输出 - 播放500Hz蜂鸣音
-void testI2SBeep() {
-  Serial.println("🔔 测试I2S输出 - 播放500Hz蜂鸣音(1秒)");
-  
-  const int freq = 500;  // 500Hz
-  const int duration = 1000;  // 1秒
-  const int samples = AUDIO_SAMPLE_RATE * duration / 1000;
-  
-  int16_t* audioData = (int16_t*)malloc(samples * sizeof(int16_t));
-  if (!audioData) {
-    Serial.println("❌ 内存分配失败");
-    return;
-  }
-  
-  // 生成正弦波
-  for (int i = 0; i < samples; i++) {
-    float t = (float)i / AUDIO_SAMPLE_RATE;
-    audioData[i] = (int16_t)(sin(2.0 * PI * freq * t) * 30000);
-  }
-  
-  // 播放
-  size_t bytes_written;
-  i2s_write(I2S_NUM, audioData, samples * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-  
-  free(audioData);
-  Serial.println("✓ 蜂鸣测试完成");
-}
-
 // ==================== TTS 语音合成与播放 ====================
-// TTS API 配置（可选：阿里云、百度、腾讯云）
-const char* TTS_TYPE = "aliyun";  // "aliyun" 或 "baidu" 或 "disabled"
+// 支持多种在线TTS服务，默认使用有道语音以提升可访问性。
 
-// 阿里云 TTS 配置（推荐）
-// AppKey/Token 请在 config_local.h / config_example.h 中提供（已在顶部包含）
-const char* ALIYUN_TTS_ENDPOINT = "https://nls-gateway-cn-shanghai.aliyuncs.com/stream/v1/tts";
+bool requestAndPlayTTS(const String& text);
+bool requestAndPlayGoogleTTS(const String& text);
+bool requestAndPlayEdgeTTS(const String& text);
+bool playMP3StreamFromURL(const String& url);
+bool playBeepTone(int freqHz = 600, int durationMs = 500);
 
-// 百度 TTS 配置（可选）- 请在 config_local.h / config_example.h 中提供（已在顶部包含）
-const char* BAIDU_TTS_ENDPOINT = "https://tsn.baidu.com/text2audio";
-
-// 直接播放阿里云 TTS PCM 流
-void playPCMFromURL(const String& url) {
-  Serial.println("🔊 开始播放音频 (PCM)...");
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    Serial.println("❌ TTS http.begin 失败");
+void speakText(String text) {
+  text.trim();
+  if (text.isEmpty()) {
+    Serial.println(F("🎙️ [TTS] 文本为空，跳过语音播报"));
     return;
   }
 
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("❌ TTS请求失败，HTTP代码: %d\n", httpCode);
-    http.end();
-    return;
+  if (!requestAndPlayTTS(text)) {
+    Serial.println(F("❌ [TTS] 语音播放失败"));
   }
+}
 
-  WiFiClient* stream = http.getStreamPtr();
-  uint8_t buffer[1024];
-  size_t totalBytes = 0;
-  unsigned long lastDataTime = millis();
+String urlEncode(const String& value) {
+  static const char* hex = "0123456789ABCDEF";
+  String encoded;
+  encoded.reserve(value.length() * 3);
 
-  while (http.connected()) {
-    int available = stream->available();
-    if (available > 0) {
-      if (available > (int)sizeof(buffer)) available = sizeof(buffer);
-      int bytesRead = stream->readBytes((char*)buffer, available);
-      if (bytesRead > 0) {
-        size_t bytesWritten = 0;
-        esp_err_t err = i2s_write(I2S_NUM, buffer, bytesRead, &bytesWritten, portMAX_DELAY);
-        if (err != ESP_OK) {
-          Serial.printf("❌ I2S写入失败: %d\n", err);
-          break;
-        }
-        totalBytes += bytesWritten;
-        lastDataTime = millis();
-      }
+  for (size_t i = 0; i < value.length(); ++i) {
+    uint8_t c = static_cast<uint8_t>(value[i]);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
+    } else if (c == ' ') {
+      encoded += '+';
     } else {
-      if (!stream->connected()) break;
-      if (millis() - lastDataTime > 3000) {
-        Serial.println("⚠️  3秒未收到音频数据，结束播放");
-        break;
-      }
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+
+  return encoded;
+}
+
+// Mask a secret for logging: show first `head` and last `tail` chars, mask the middle
+String maskString(const String &s, int head = 6, int tail = 4) {
+  if (s.length() <= head + tail) return String("****");
+  String out = s.substring(0, head);
+  out += "...";
+  out += s.substring(s.length() - tail);
+  return out;
+}
+
+bool playBeepTone(int freqHz, int durationMs) {
+  Serial.println(F("🔔 [TTS] 播放测试蜂鸣"));
+
+  AudioOutputI2S* out = new AudioOutputI2S(I2S_NUM, 0);
+  if (out == nullptr) {
+    Serial.println(F("❌ [TTS] 分配I2S输出失败"));
+    return false;
+  }
+
+  if (!out->SetPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN)) {
+    Serial.println(F("❌ [TTS] I2S引脚配置失败"));
+    delete out;
+    return false;
+  }
+  out->SetOutputModeMono(true);
+  out->SetRate(AUDIO_SAMPLE_RATE);
+
+  if (!out->begin()) {
+    Serial.println(F("❌ [TTS] I2S输出启动失败"));
+    delete out;
+    return false;
+  }
+
+  const int totalSamples = (AUDIO_SAMPLE_RATE * durationMs) / 1000;
+  const float phaseIncrement = 2.0f * PI * static_cast<float>(freqHz) / static_cast<float>(AUDIO_SAMPLE_RATE);
+  float phase = 0.0f;
+  int16_t frame[2];
+
+  for (int i = 0; i < totalSamples; ++i) {
+    const int16_t sample = static_cast<int16_t>(sinf(phase) * 28000.0f);
+    frame[0] = sample;
+    frame[1] = sample;
+
+    while (!out->ConsumeSample(frame)) {
       delay(1);
     }
-  }
 
-  http.end();
-  i2s_zero_dma_buffer(I2S_NUM);
-  Serial.printf("✓ PCM 播放完成，总字节数: %u (约 %.2f 秒)\n", (unsigned int)totalBytes, totalBytes / 2.0 / AUDIO_SAMPLE_RATE);
-}
-
-// 调用在线 TTS API，将文本转换为语音并播放
-void speakText(String text) {
-  if (strcmp(TTS_TYPE, "disabled") == 0) {
-    Serial.println("\n🔊 [语音输出] 功能已禁用");
-    Serial.println("输出内容: " + text);
-    return;
-  }
-  
-  Serial.println("\n🔊 [步骤 5/5] 语音播报...");
-  
-  // 检查 WiFi 连接
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi未连接，无法使用在线TTS");
-    return;
-  }
-  
-  // 限制文本长度（避免超时）
-  if (text.length() > 300) {
-    text = text.substring(0, 300) + "...";
-    Serial.println("⚠️  文本过长，已截取前300字符");
-  }
-  
-  Serial.printf("📝 待播报文本: %s\n", text.c_str());
-  
-  // URL 编码文本
-  String encodedText = urlEncode(text);
-  
-  // 构建阿里云TTS请求URL (PCM 16kHz)
-  String ttsURL = String(ALIYUN_TTS_ENDPOINT) + 
-                  "?appkey=" + ALIYUN_TTS_APPKEY +
-                  "&text=" + encodedText +
-                  "&format=pcm" +
-                  "&sample_rate=16000" +
-                  "&voice=xiaoyun";  // 可选: xiaoyun/xiaogang/ruoxi 等
-  
-  Serial.println("🎤 调用阿里云TTS...");
-  
-  // 直接播放PCM音频流
-  playPCMFromURL(ttsURL);
-}
-
-
-
-// URL 编码函数
-String urlEncode(String str) {
-  String encoded = "";
-  char c;
-  char code0;
-  char code1;
-  
-  for (int i = 0; i < str.length(); i++) {
-    c = str.charAt(i);
-    if (c == ' ') {
-      encoded += '+';
-    } else if (isalnum(c)) {
-      encoded += c;
-    } else {
-      code1 = (c & 0xf) + '0';
-      if ((c & 0xf) > 9) {
-        code1 = (c & 0xf) - 10 + 'A';
-      }
-      c = (c >> 4) & 0xf;
-      code0 = c + '0';
-      if (c > 9) {
-        code0 = c - 10 + 'A';
-      }
-      encoded += '%';
-      encoded += code0;
-      encoded += code1;
+    phase += phaseIncrement;
+    if (phase > 2.0f * PI) {
+      phase -= 2.0f * PI;
     }
   }
-  return encoded;
+
+  out->flush();
+  out->stop();
+  delete out;
+
+  Serial.println(F("✅ [TTS] 蜂鸣播放完成"));
+  return true;
+}
+
+bool playMP3StreamFromURL(const String& url) {
+  Serial.println(F("🎧 [TTS] 开始拉取音频流"));
+  Serial.printf("🔎 [TTS] 请求 URL: %s\n", url.c_str());
+  Serial.printf("🔋 [TTS] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+
+  AudioHTTPSStream* httpsStream = nullptr;
+  AudioFileSourceHTTPStream* httpStream = nullptr;
+  AudioFileSource* file = nullptr;
+
+  if (url.startsWith("https://")) {
+    Serial.println(F("🔐 [TTS] 使用 HTTPS 流"));
+    httpsStream = new AudioHTTPSStream();
+    if (httpsStream == nullptr) {
+      Serial.println(F("❌ [TTS] 分配HTTPS流对象失败"));
+      return false;
+    }
+    httpsStream->setUseInsecure(true);
+    httpsStream->setFollowRedirects(true);
+    httpsStream->setTimeout(20000);
+    httpsStream->setUserAgent(F("Mozilla/5.0 (ESP32-S3)"));
+
+    if (!httpsStream->open(url.c_str())) {
+      Serial.println(F("❌ [TTS] 建立HTTPS音频流失败，尝试诊断..."));
+      httpsDiagnostic(url);
+      delete httpsStream;
+      return false;
+    }
+    Serial.println(F("✓ [TTS] HTTPS 流已打开"));
+    file = httpsStream;
+  } else {
+    Serial.println(F("🔐 [TTS] 使用 HTTP 流"));
+    httpStream = new AudioFileSourceHTTPStream();
+    if (httpStream == nullptr) {
+      Serial.println(F("❌ [TTS] 分配HTTP流对象失败"));
+      return false;
+    }
+    if (!httpStream->open(url.c_str())) {
+      Serial.println(F("❌ [TTS] 建立HTTP音频流失败"));
+      delete httpStream;
+      return false;
+    }
+    Serial.println(F("✓ [TTS] HTTP 流已打开"));
+    file = httpStream;
+  }
+
+  AudioOutputI2S* out = new AudioOutputI2S(I2S_NUM, 0);
+  if (out == nullptr) {
+    Serial.println(F("❌ [TTS] 分配I2S输出失败"));
+    if (httpsStream) {
+      delete httpsStream;
+    }
+    if (httpStream) {
+      delete httpStream;
+    }
+    return false;
+  }
+  out->SetPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
+  out->SetGain(0.8f);
+
+  AudioGeneratorMP3* mp3 = new AudioGeneratorMP3();
+  if (mp3 == nullptr) {
+    Serial.println(F("❌ [TTS] 分配MP3解码器失败"));
+    delete out;
+    if (httpsStream) {
+      delete httpsStream;
+    }
+    if (httpStream) {
+      delete httpStream;
+    }
+    return false;
+  }
+
+  bool success = false;
+  if (mp3->begin(file, out)) {
+    Serial.println(F("🔊 [TTS] 正在播放语音..."));
+    while (mp3->isRunning()) {
+      if (!mp3->loop()) {
+        Serial.println(F("✖ [TTS] mp3->loop() 返回 false"));
+        mp3->stop();
+        break;
+      }
+      success = true;
+      delay(1);
+    }
+    if (mp3->isRunning()) {
+      mp3->stop();
+    }
+  } else {
+    Serial.println(F("❌ [TTS] MP3解码器初始化失败"));
+    Serial.printf("🔋 [TTS] 解码器初始化时可用堆内存: %d bytes\n", ESP.getFreeHeap());
+  }
+
+  delete mp3;
+  delete out;
+  if (httpsStream) {
+    delete httpsStream;
+  }
+  if (httpStream) {
+    delete httpStream;
+  }
+
+  if (success) {
+    Serial.println(F("✅ [TTS] 音频播放完成"));
+  } else {
+    Serial.println(F("❌ [TTS] 音频播放失败"));
+  }
+
+  return success;
+}
+
+bool requestAndPlayGoogleTTS(const String& text) {
+// ...existing code...
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
+    return false;
+  }
+
+  String limitedText = text;
+  if (limitedText.length() > 200) {
+    limitedText = limitedText.substring(0, 200);
+    Serial.println(F("ℹ️ [TTS] 文本过长，已截断至200字符"));
+  }
+
+  Serial.print(F("📝 [TTS] 谷歌TTS文本: "));
+  Serial.println(limitedText);
+
+  String encoded = urlEncode(limitedText);
+  String target = String("https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=zh-CN&q=") + encoded;
+  String url = target;
+  // 如果配置了代理，则把真实目标URL编码后作为代理参数
+  if (TTS_PROXY_URL != nullptr && strlen(TTS_PROXY_URL) > 0) {
+    String proxy = String(TTS_PROXY_URL);
+    // 代理约定：/tts_proxy?url=<encoded_target_url>
+    proxy += String("?url=") + urlEncode(target);
+    url = proxy;
+    Serial.printf("ℹ️ [TTS] 使用代理请求谷歌TTS: %s\n", proxy.c_str());
+  }
+
+  Serial.println(F("🌐 [TTS] 请求谷歌翻译TTS"));
+  return playMP3StreamFromURL(url);
+}
+
+bool requestAndPlayYoudaoTTS(const String& text) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
+    return false;
+  }
+
+  String limitedText = text;
+  if (limitedText.length() > 80) {
+    limitedText = limitedText.substring(0, 80);
+    Serial.println(F("ℹ️ [TTS] 文本过长，已截断至80字符"));
+  }
+
+  String encoded = urlEncode(limitedText);
+  String target = String("http://dict.youdao.com/dictvoice?type=2&audio=") + encoded;
+  String url = target;
+  if (TTS_PROXY_URL != nullptr && strlen(TTS_PROXY_URL) > 0) {
+    String proxy = String(TTS_PROXY_URL);
+    proxy += String("?url=") + urlEncode(target);
+    url = proxy;
+    Serial.printf("ℹ️ [TTS] 使用代理请求有道TTS: %s\n", proxy.c_str());
+  }
+
+  Serial.println(F("🌐 [TTS] 请求有道TTS"));
+  return playMP3StreamFromURL(url);
+}
+
+// 百度TTS provider（推荐通过本地代理，避免token管理和HTTPS问题）
+bool requestAndPlayBaiduTTS(const String& text) {
+  // 如果配置了 BAIDU_API_KEY 与 SECRET，则优先在设备上直接获取 token 并直连百度（无需代理）
+  // 直接优先：若配置了临时 access token 则直接使用；否则尝试设备获取 token 并直连
+  if (strlen(BAIDU_TTS_ACCESS_TOKEN) > 0) {
+    String limitedText = text;
+    if (limitedText.length() > 200) limitedText = limitedText.substring(0,200);
+    String encoded = urlEncode(limitedText);
+    String url = String("http://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + String(BAIDU_TTS_ACCESS_TOKEN) + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+    Serial.printf("🔐 [Baidu] 使用 config 中的 access_token 请求 (token掩码=%s)\n", maskString(String(BAIDU_TTS_ACCESS_TOKEN)).c_str());
+    Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
+    return playMP3StreamFromURL(url);
+  }
+
+  // 尝试设备端获取 token 并直连
+  return requestAndPlayBaiduTTS_OnDevice(text);
+}
+
+// 在设备上获取 token（HTTPS），并缓存
+bool fetchBaiduTokenIfNeeded() {
+  if (baidu_access_token.length() > 0 && millis() < baidu_token_expires_ms) return true;
+  if (strlen(BAIDU_API_KEY) == 0 || strlen(BAIDU_SECRET_KEY) == 0) return false;
+  Serial.println(F("🔐 [Baidu] 获取 access_token 中..."));
+  Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+  Serial.printf("🔑 [Baidu] 使用 API_KEY=%s, SECRET=%s (已掩码)\n", maskString(String(BAIDU_API_KEY)).c_str(), maskString(String(BAIDU_SECRET_KEY)).c_str());
+  String url = String("https://openapi.baidu.com/oauth/2.0/token?grant_type=client_credentials&client_id=") + BAIDU_API_KEY + "&client_secret=" + BAIDU_SECRET_KEY;
+
+  WiFiClientSecure client;
+  client.setInsecure(); // 开发时可用，生产建议安装根证书
+  HTTPClient http;
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) {
+    Serial.println(F("✗ [Baidu] HTTP begin(token) 失败"));
+    return false;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("✗ [Baidu] token 请求返回 %d\n", code);
+    String err = http.getString();
+    if (err.length() > 512) err = err.substring(0, 512);
+    Serial.println(err);
+    http.end();
+    return false;
+  }
+  String payload = http.getString();
+  Serial.print("↪ [Baidu] token 返回片段: ");
+  if (payload.length() > 512) Serial.println(payload.substring(0, 512)); else Serial.println(payload);
+  http.end();
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.println(F("✗ [Baidu] JSON 解析 token 失败"));
+    Serial.println(payload);
+    return false;
+  }
+  if (!doc.containsKey("access_token")) {
+    Serial.println(F("✗ [Baidu] token 响应不含 access_token"));
+    Serial.println(payload);
+    return false;
+  }
+  baidu_access_token = doc["access_token"].as<String>();
+  int expires_in = doc["expires_in"].as<int>();
+  baidu_token_expires_ms = millis() + (unsigned long)(expires_in - 60) * 1000UL;
+  Serial.printf("✓ [Baidu] 获取到 token，expires_in=%d 秒\n", expires_in);
+  Serial.printf("🔑 [Baidu] access_token (已掩码): %s\n", maskString(baidu_access_token).c_str());
+  Serial.printf("⏳ [Baidu] 本地 token 过期时间 (ms since boot): %lu\n", baidu_token_expires_ms);
+  return true;
+}
+
+// 设备上直接调用百度TTS
+bool requestAndPlayBaiduTTS_OnDevice(const String& text) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
+    return false;
+  }
+  // 优先使用 config 中的临时 access token（用于快速测试）
+  if (strlen(BAIDU_TTS_ACCESS_TOKEN) > 0) {
+    String limitedText = text;
+    if (limitedText.length() > 200) limitedText = limitedText.substring(0,200);
+    String encoded = urlEncode(limitedText);
+    String url = String("http://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + String(BAIDU_TTS_ACCESS_TOKEN) + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+    Serial.printf("🔐 [Baidu] 使用 config 中的 access_token 请求 (token掩码=%s)\n", maskString(String(BAIDU_TTS_ACCESS_TOKEN)).c_str());
+    Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
+    return playMP3StreamFromURL(url);
+  }
+
+  if (!fetchBaiduTokenIfNeeded()) {
+    Serial.println(F("✗ [Baidu] 无法获取 token，直接调用百度失败"));
+    return false;
+  }
+  String limitedText = text;
+  if (limitedText.length() > 200) limitedText = limitedText.substring(0,200);
+  String encoded = urlEncode(limitedText);
+  String url = String("http://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + baidu_access_token + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+  Serial.printf("🔐 [Baidu] 设备直连请求 (token掩码=%s)\n", maskString(baidu_access_token).c_str());
+  Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+  Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
+  return playMP3StreamFromURL(url);
+}
+
+bool requestAndPlayEdgeTTS(const String& text) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
+    return false;
+  }
+
+  String limitedText = text;
+  if (limitedText.length() > 200) {
+    limitedText = limitedText.substring(0, 200);
+    Serial.println(F("ℹ️ [TTS] 文本过长，已截断至200字符"));
+  }
+
+  String encoded = urlEncode(limitedText);
+  String target = String("https://tts-api-edge.vercel.app/api/tts?text=") + encoded + "&voice=zh-CN-XiaoxiaoNeural";
+  String url = target;
+  if (TTS_PROXY_URL != nullptr && strlen(TTS_PROXY_URL) > 0) {
+    String proxy = String(TTS_PROXY_URL);
+    proxy += String("?url=") + urlEncode(target);
+    url = proxy;
+    Serial.printf("ℹ️ [TTS] 使用代理请求Edge TTS: %s\n", proxy.c_str());
+  }
+
+  Serial.println(F("🌐 [TTS] 请求Edge TTS"));
+  return playMP3StreamFromURL(url);
+}
+
+bool requestAndPlayTTS(const String& text) {
+  if (TTS_PROVIDER == nullptr) {
+    Serial.println(F("❌ [TTS] 未配置语音提供商"));
+    return false;
+  }
+
+  // 尝试顺序：首选提供商 -> Google -> Edge -> Youdao -> Baidu
+  const char* order[5];
+  int idx = 0;
+  order[idx++] = TTS_PROVIDER;
+  if (strcmp(TTS_PROVIDER, "google") != 0) order[idx++] = "google";
+  if (strcmp(TTS_PROVIDER, "edge") != 0) order[idx++] = "edge";
+  if (strcmp(TTS_PROVIDER, "youdao") != 0) order[idx++] = "youdao";
+  if (strcmp(TTS_PROVIDER, "baidu") != 0) order[idx++] = "baidu";
+
+  for (int i = 0; i < idx; ++i) {
+    const char* prov = order[i];
+    Serial.printf("ℹ️ [TTS] 尝试语音提供商: %s\n", prov);
+    bool ok = false;
+    if (strcmp(prov, "google") == 0) ok = requestAndPlayGoogleTTS(text);
+    else if (strcmp(prov, "edge") == 0) ok = requestAndPlayEdgeTTS(text);
+    else if (strcmp(prov, "youdao") == 0) ok = requestAndPlayYoudaoTTS(text);
+    else if (strcmp(prov, "baidu") == 0) ok = requestAndPlayBaiduTTS(text);
+    else {
+      Serial.printf("⚠️ [TTS] 未知提供商跳过: %s\n", prov);
+    }
+
+    if (ok) {
+      Serial.printf("✅ [TTS] 由 %s 成功播放\n", prov);
+      return true;
+    } else {
+      Serial.printf("✗ [TTS] %s 播放失败，尝试下一个提供商...\n", prov);
+    }
+  }
+
+  Serial.println(F("❌ [TTS] 所有语音提供商均失败"));
+  return false;
 }
 
 // ==================== 执行完整的拍照分析流程 ====================
@@ -1143,6 +1382,11 @@ static esp_err_t ai_analyze_handler(httpd_req_t *req){
   // 清理base64字符串释放内存
   base64Image = "";
   
+  bool shouldPlay = true;
+  if (aiResponse.indexOf("错误") >= 0 || aiResponse.indexOf("失败") >= 0) {
+    shouldPlay = false;
+  }
+
   // 4. 构建JSON响应
   DynamicJsonDocument doc(8192);
   
@@ -1157,6 +1401,13 @@ static esp_err_t ai_analyze_handler(httpd_req_t *req){
   
   String jsonResponse;
   serializeJson(doc, jsonResponse);
+
+  if (shouldPlay) {
+    Serial.println("🔊 [Web] 准备语音播报AI结果...");
+    speakText(aiResponse);
+  } else {
+    Serial.println("ℹ️ [Web] AI返回错误消息，跳过语音播报");
+  }
   
   // 返回JSON响应
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -1169,11 +1420,11 @@ static esp_err_t ai_analyze_handler(httpd_req_t *req){
 // 临时路由：蜂鸣测试
 static esp_err_t beep_handler(httpd_req_t *req) {
   Serial.println("/beep 路由调用 - 播放测试蜂鸣");
-  testI2SBeep();
-  const char* ok_json = "{\"success\":true}";
+  bool ok = playBeepTone(600, 600);
+  const char* response_json = ok ? "{\"success\":true}" : "{\"success\":false}";
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, ok_json, strlen(ok_json));
+  return httpd_resp_send(req, response_json, strlen(response_json));
 }
 
 // 启动Web服务器
@@ -1261,18 +1512,11 @@ void setup() {
   Serial.printf("✓ 触发按钮配置在 GPIO%d\n", TRIGGER_BUTTON_PIN);
   
   // 初始化摄像头
-  Serial.println("\n[1/4] 初始化摄像头...");
+  Serial.println("\n[1/3] 初始化摄像头...");
   setupCamera();
   
-  // 初始化I2S音频输出
-  Serial.println("\n[2/4] 初始化I2S音频输出...");
-  initI2S();
-  
-  // 可选：测试I2S输出
-  // testI2SBeep();  // 取消注释以测试蜂鸣音
-  
   // 连接WiFi
-  Serial.println("\n[3/4] 连接WiFi...");
+  Serial.println("\n[2/3] 连接WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
@@ -1292,8 +1536,28 @@ void setup() {
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
     
-    // 启动HTTP服务器
-    Serial.println("\n[4/4] 启动Web服务器...");
+    // 尝试通过 NTP 同步时间，HTTPS 连接需要正确的系统时间
+    configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
+    Serial.println("⏳ 尝试 NTP 时间同步（最多等待 10 秒）...");
+    time_t now = time(nullptr);
+    int ntpWait = 0;
+    while (now < 1600000000 && ntpWait < 10) { // 约为 2020-09-13 之后的时间
+      delay(1000);
+      Serial.print('.');
+      now = time(nullptr);
+      ntpWait++;
+    }
+    Serial.println();
+    if (now >= 1600000000) {
+      struct tm timeinfo;
+      gmtime_r(&now, &timeinfo);
+      Serial.printf("✓ NTP 时间同步成功: %s", asctime(&timeinfo));
+    } else {
+      Serial.println("✗ NTP 时间同步失败，HTTPS 可能会失败");
+    }
+    
+  // 启动HTTP服务器
+  Serial.println("\n[3/3] 启动Web服务器...");
     startCameraServer();
     
     Serial.println("\n╔══════════════════════════════════════╗");
@@ -1301,66 +1565,15 @@ void setup() {
     Serial.println("╚══════════════════════════════════════╝");
     Serial.print("🌐 Web界面: http://");
     Serial.println(WiFi.localIP());
-    Serial.println("📷 功能: 视频流 | 拍照 | AI分析 | 🔊语音播报");
-    Serial.println("🔘 按下Boot按钮触发AI分析");
-    Serial.printf("🔊 音频输出: MAX98357A (引脚 BCLK=%d, LRC=%d, DIN=%d)\n", 
-                  I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
-    if (autoCapture) {
-      Serial.printf("⏰ 定时拍照: 每%lu秒自动分析\n", autoCaptureInterval / 1000);
-    }
-    Serial.println("══════════════════════════════════════");
-    Serial.println("\n💡 提示:");
-    Serial.println("   1. 在代码中配置API密钥 (AI视觉 + TTS)");
-    Serial.println("   2. 选择API类型 (qwen推荐)");
-    Serial.println("   3. 通过Web界面或按钮触发AI分析");
-    Serial.println("   4. AI结果会自动通过扬声器播报\n");
-    
-    digitalWrite(LED_GPIO_NUM, HIGH); // LED亮表示启动完成
+    Serial.println();
   } else {
     Serial.println("\n✗ WiFi连接失败");
-    Serial.println("请检查WiFi名称和密码");
+    Serial.println("   请检查WiFi配置");
   }
 }
 
 void loop() {
-  // 检测按钮触发
   checkButtonTrigger();
-  
-  // 定时自动拍照分析
-  if (autoCapture && WiFi.status() == WL_CONNECTED) {
-    if (millis() - lastAutoCaptureTime > autoCaptureInterval) {
-      Serial.println("\n⏰ 定时触发：自动拍照分析");
-      performVisionAnalysis();
-      lastAutoCaptureTime = millis();
-    }
-  }
-  
-  // 定期打印状态
-  static unsigned long lastStatusTime = 0;
-  if (millis() - lastStatusTime > 60000) {  // 每60秒
-    if(WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n────────── 系统状态 ──────────");
-      Serial.printf("⏱️  运行时间: %lu 秒 (%.1f 分钟)\n", 
-                    millis() / 1000, millis() / 60000.0);
-      Serial.printf("💾 堆内存: %d bytes (%.1f KB)\n", 
-                    ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
-      Serial.printf("💾 PSRAM: %d bytes (%.1f MB)\n", 
-                    ESP.getFreePsram(), ESP.getFreePsram() / 1024.0 / 1024.0);
-      Serial.printf("📶 WiFi信号: %d dBm\n", WiFi.RSSI());
-      Serial.println("─────────────────────────────\n");
-    }
-    lastStatusTime = millis();
-  }
-  
-  // 临时：串口命令支持，输入 'beep' 将触发 I2S 蜂鸣测试
-  if (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd.equalsIgnoreCase("beep")) {
-      Serial.println("串口命令: beep -> 播放测试蜂鸣");
-      testI2SBeep();
-    }
-  }
 
-  delay(50);  // 短延迟，避免占用CPU
+  delay(10);
 }
