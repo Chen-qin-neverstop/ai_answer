@@ -13,6 +13,8 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
 #include "AudioHTTPSStream.h"
+#include <SPIFFS.h>
+#include <AudioFileSourceSPIFFS.h>
 #include <vector>
 #include <functional>
 
@@ -885,8 +887,8 @@ bool playTextInChunks(const TTSChunkFunc &chunkFunc, const String &text, size_t 
     } else {
       anyOk = true;
     }
-    // small delay between chunks to ensure streams close cleanly
-    delay(200);
+    // 增加间隔，确保硬件与流资源完全释放，避免重建过快导致噪音或重复
+    delay(500);
   }
   return anyOk;
 }
@@ -1131,7 +1133,15 @@ bool playMP3StreamFromURL(const String& url) {
     return false;
   }
   out->SetPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
-  out->SetGain(0.8f);
+  out->SetGain(0.65f);
+
+  if (!out->begin()) {
+    Serial.println(F("❌ [TTS] I2S 输出 begin() 失败"));
+    delete out;
+    if (httpsStream) delete httpsStream;
+    if (httpStream) delete httpStream;
+    return false;
+  }
 
   AudioGeneratorMP3* mp3 = new AudioGeneratorMP3();
   if (mp3 == nullptr) {
@@ -1167,6 +1177,9 @@ bool playMP3StreamFromURL(const String& url) {
   }
 
   delete mp3;
+  // ensure audio output is cleanly stopped
+  out->flush();
+  out->stop();
   delete out;
   if (httpsStream) {
     delete httpsStream;
@@ -1181,7 +1194,112 @@ bool playMP3StreamFromURL(const String& url) {
     Serial.println(F("❌ [TTS] 音频播放失败"));
   }
 
+  // 如果流播放失败，则尝试下载到 SPIFFS 再播放（回退方案）
+  if (!success) {
+    Serial.println(F("↪ [TTS] 流播放失败，尝试回退：下载到 SPIFFS 并播放本地文件"));
+    String tmpPath = String("/tts_tmp_") + String(millis()) + String(".mp3");
+    if (downloadMP3ToSPIFFS(reqUrl, tmpPath)) {
+      bool localOk = playMP3FromSPIFFS(tmpPath);
+      // 删除临时文件
+      if (SPIFFS.exists(tmpPath)) {
+        SPIFFS.remove(tmpPath);
+      }
+      if (localOk) {
+        Serial.println(F("✅ [TTS] 回退播放成功 (SPIFFS)"));
+        success = true;
+      } else {
+        Serial.println(F("✗ [TTS] 回退播放失败 (SPIFFS)"));
+      }
+    } else {
+      Serial.println(F("✗ [TTS] 下载到 SPIFFS 失败，无法回退播放"));
+    }
+  }
+
   return success;
+}
+
+// 下载MP3到SPIFFS，返回是否成功并把文件路径写入 outPath
+bool downloadMP3ToSPIFFS(const String &url, const String &outPath) {
+  Serial.printf("⬇️ [TTS] 下载音频到 SPIFFS: %s -> %s\n", url.c_str(), outPath.c_str());
+  if (!SPIFFS.begin(true)) {
+    Serial.println(F("✗ [TTS] SPIFFS mount 失败，无法下载"));
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(client, url)) {
+    Serial.println(F("✗ [TTS] HTTP begin 失败 (download)"));
+    return false;
+  }
+
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("✗ [TTS] 下载请求返回 %d\n", code);
+    http.end();
+    return false;
+  }
+
+  File f = SPIFFS.open(outPath, FILE_WRITE);
+  if (!f) {
+    Serial.println(F("✗ [TTS] 无法在 SPIFFS 创建文件"));
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  int len = 0;
+  while (http.connected() && (len = stream->available() ? stream->readBytes((char*)buf, sizeof(buf)) : 0) > 0) {
+    f.write(buf, len);
+  }
+
+  f.close();
+  http.end();
+  Serial.println(F("✓ [TTS] 下载完成到 SPIFFS"));
+  return true;
+}
+
+// 从 SPIFFS 播放下载的 MP3 文件
+bool playMP3FromSPIFFS(const String &path) {
+  Serial.printf("▶️ [TTS] 从 SPIFFS 播放: %s\n", path.c_str());
+  if (!SPIFFS.begin(false)) {
+    Serial.println(F("✗ [TTS] SPIFFS 未挂载，无法播放"));
+    return false;
+  }
+  AudioFileSourceSPIFFS *file = new AudioFileSourceSPIFFS(path.c_str());
+  if (!file) {
+    Serial.println(F("✗ [TTS] 无法分配 SPIFFS 文件源"));
+    return false;
+  }
+
+  AudioOutputI2S* out = new AudioOutputI2S(I2S_NUM, 0);
+  out->SetPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
+  out->SetGain(0.65f);
+  if (!out->begin()) {
+    Serial.println(F("✗ [TTS] SPIFFS 播放：I2S begin() 失败"));
+    delete out; delete file; return false;
+  }
+  AudioGeneratorMP3* mp3 = new AudioGeneratorMP3();
+  bool ok = false;
+  if (mp3->begin(file, out)) {
+    Serial.println(F("🔊 [TTS] 正在播放 SPIFFS 中的语音..."));
+    while (mp3->isRunning()) {
+      if (!mp3->loop()) { mp3->stop(); break; }
+      ok = true; delay(1);
+    }
+    if (mp3->isRunning()) mp3->stop();
+  } else {
+    Serial.println(F("✗ [TTS] SPIFFS 上的 MP3 初始化失败"));
+  }
+
+  delete mp3;
+  out->flush(); out->stop(); delete out;
+  delete file;
+  if (ok) Serial.println(F("✅ [TTS] SPIFFS 播放完成")); else Serial.println(F("❌ [TTS] SPIFFS 播放失败"));
+  return ok;
 }
 
 
@@ -1578,6 +1696,14 @@ void setup() {
   // 初始化摄像头
   Serial.println("\n[1/3] 初始化摄像头...");
   setupCamera();
+
+  // 初始化 SPIFFS（用于 TTS 临时缓存）
+  Serial.println("\n[?] 尝试挂载 SPIFFS 用于 TTS 缓存...");
+  if (SPIFFS.begin(true)) {
+    Serial.println("✓ SPIFFS 挂载成功");
+  } else {
+    Serial.println("✗ SPIFFS 挂载失败（可能未选择带 SPIFFS 的分区），TTS 回退到本地文件将不可用");
+  }
   
   // 连接WiFi
   Serial.println("\n[2/3] 连接WiFi...");
