@@ -13,6 +13,8 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
 #include "AudioHTTPSStream.h"
+#include <vector>
+#include <functional>
 
 // 简单的 HTTPS 诊断工具：打印响应码和前 200 字节（用于调试Edge TTS等服务）
 void httpsDiagnostic(const String &url) {
@@ -110,8 +112,8 @@ const char* QWEN_MODEL = "qwen-vl-plus";  // 可根据需要调整型号
 const char* CUSTOM_ENDPOINT = "https://your-custom-endpoint/v1/chat/completions";
 const char* CUSTOM_MODEL = "your-model-name";
 
-// 提示词配置
-const char* VISION_PROMPT = "请详细描述这张图片中的内容，包括物体、场景、颜色等细节。用中文回答。";
+// 提示词配置（更中性、明确的任务指令，要求较长输出）
+const char* VISION_PROMPT = "请用中文以客观、中立的口吻详细描述这张图片的内容，包含：人物外观（性别/年龄段/穿着/表情/姿态）、场景（室内/室外/环境光）、颜色与材质、画面中显著物体及其位置、可能的动作与线索。请分要点说明，至少输出 300 字，不要做身份推断或生成与图像无关的内容。";
 
 // ==================== TTS 提供商选择 ====================
 // 可选: "google" 谷歌翻译TTS, "edge" 微软Edge TTS, "baidu" 百度TTS
@@ -743,7 +745,8 @@ String callVisionAPI(String base64Image) {
   // 构建JSON请求体 (OpenAI兼容格式)
   DynamicJsonDocument doc(4096);
   doc["model"] = model;
-  doc["max_tokens"] = 500;
+  doc["max_tokens"] = 1024; // increase output capacity
+  doc["temperature"] = 0.2;
   
   JsonArray messages = doc.createNestedArray("messages");
   JsonObject message = messages.createNestedObject();
@@ -777,7 +780,8 @@ String callVisionAPI(String base64Image) {
     Serial.printf("响应长度: %d bytes\n", payload.length());
     
     // 解析响应
-    DynamicJsonDocument responseDoc(8192);
+  // enlarge response buffer to handle longer textual outputs
+  DynamicJsonDocument responseDoc(16384);
     DeserializationError error = deserializeJson(responseDoc, payload);
     
     if (error) {
@@ -788,8 +792,15 @@ String callVisionAPI(String base64Image) {
     } else {
       // OpenAI兼容格式响应解析 (适用于OpenAI和通义千问)
       if (responseDoc.containsKey("choices")) {
+        // print finish_reason if present for debugging (helps detect truncation)
+        if (responseDoc["choices"][0].containsKey("finish_reason")) {
+          const char* fr = responseDoc["choices"][0]["finish_reason"].as<const char*>();
+          Serial.printf("↪ finish_reason: %s\n", fr);
+        }
         response = responseDoc["choices"][0]["message"]["content"].as<String>();
         Serial.println("✓ API调用成功");
+        Serial.printf("↪ 返回文本长度: %d 字符\n", response.length());
+        if (response.length() > 2000) Serial.println(response.substring(0, 2000));
       } else if (responseDoc.containsKey("error")) {
         response = "API错误: " + responseDoc["error"]["message"].as<String>();
         Serial.println("✗ API返回错误");
@@ -824,10 +835,61 @@ void outputToSerial(String aiResponse) {
 // 支持多种在线TTS服务，默认使用有道语音以提升可访问性。
 
 bool requestAndPlayTTS(const String& text);
-bool requestAndPlayGoogleTTS(const String& text);
-bool requestAndPlayEdgeTTS(const String& text);
 bool playMP3StreamFromURL(const String& url);
 bool playBeepTone(int freqHz = 600, int durationMs = 500);
+
+// helper: split long text into chunks (tries to split at punctuation or space)
+std::vector<String> splitTextIntoChunks(const String &text, size_t maxLen) {
+  std::vector<String> chunks;
+  if (text.length() <= (int)maxLen) {
+    chunks.push_back(text);
+    return chunks;
+  }
+
+  int pos = 0;
+  int len = text.length();
+  while (pos < len) {
+    int remain = len - pos;
+    int take = remain <= (int)maxLen ? remain : (int)maxLen;
+    // try to find a punctuation or space backwards within take
+    int splitPos = -1;
+    for (int i = take - 1; i >= 0; --i) {
+      char c = text.charAt(pos + i);
+      if (c == '\n' || c == '。' || c == '！' || c == '？' || c == '.' || c == '!' || c == '?' || c == ';' || c == '；' || c == ',' || c == '，' || c == ' ' || c == '、') {
+        splitPos = i + 1; // include punctuation
+        break;
+      }
+    }
+    if (splitPos == -1) splitPos = take; // no punctuation found
+
+    String part = text.substring(pos, pos + splitPos);
+    part.trim();
+    if (part.length() > 0) chunks.push_back(part);
+    pos += splitPos;
+  }
+  return chunks;
+}
+
+using TTSChunkFunc = std::function<bool(const String&)>;
+
+// Play text by splitting into chunks and calling the chunk handler sequentially
+bool playTextInChunks(const TTSChunkFunc &chunkFunc, const String &text, size_t maxLen) {
+  std::vector<String> chunks = splitTextIntoChunks(text, maxLen);
+  bool anyOk = false;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    Serial.printf("ℹ️ [TTS] 播放第 %d/%d 段，长度=%d\n", (int)(i+1), (int)chunks.size(), chunks[i].length());
+    bool ok = chunkFunc(chunks[i]);
+    if (!ok) {
+      Serial.printf("✗ [TTS] 第 %d 段播放失败\n", (int)(i+1));
+      // continue to next chunk to try to play remaining text
+    } else {
+      anyOk = true;
+    }
+    // small delay between chunks to ensure streams close cleanly
+    delay(200);
+  }
+  return anyOk;
+}
 
 void speakText(String text) {
   text.trim();
@@ -927,11 +989,101 @@ bool playMP3StreamFromURL(const String& url) {
   Serial.printf("🔎 [TTS] 请求 URL: %s\n", url.c_str());
   Serial.printf("🔋 [TTS] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
 
+  // work on a mutable copy because parameter is const
+  String reqUrl = url;
+
+  // Runtime safety: if URL uses http://, force to https:// to avoid plaintext redirect or proxy issues
+  if (reqUrl.startsWith("http://")) {
+    String old = reqUrl;
+    reqUrl = String("https://") + reqUrl.substring(7);
+    Serial.println(F("⚠️ [TTS] 将 http:// 强制升级为 https://，以避免被中间代理篡改"));
+    Serial.printf("↪ 原始 URL: %s\n", old.c_str());
+    Serial.printf("↪ 升级后 URL: %s\n", reqUrl.c_str());
+  }
+
+  // --- Diagnostic probe: do a lightweight HTTP GET to inspect headers and first bytes ---
+  Serial.println(F("🔍 [TTS] 进行诊断性 HTTP 探测（仅获取前若干字节以判断响应类型）"));
+  {
+    HTTPClient httpProbe;
+    WiFiClient *baseClient = nullptr;
+    WiFiClientSecure *secureClient = nullptr;
+    bool isHttps = reqUrl.startsWith("https://");
+    if (isHttps) {
+      secureClient = new WiFiClientSecure();
+      secureClient->setInsecure();
+      baseClient = secureClient;
+      if (!httpProbe.begin(*secureClient, reqUrl)) {
+        Serial.println(F("✗ [TTS][probe] HTTPS begin 失败"));
+      }
+    } else {
+      baseClient = new WiFiClient();
+      if (!httpProbe.begin(reqUrl)) {
+        Serial.println(F("✗ [TTS][probe] HTTP begin 失败"));
+      }
+    }
+
+  httpProbe.setTimeout(5000);
+  // set browser-like User-Agent to avoid anti-bot / anti-leech responses
+  httpProbe.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+  int code = httpProbe.GET();
+    Serial.printf("↪ [TTS][probe] HTTP 响应码: %d\n", code);
+    if (code == 200) {
+      String ctype = httpProbe.header("Content-Type");
+      long clen = httpProbe.getSize();
+      Serial.printf("↪ [TTS][probe] Content-Type: %s\n", ctype.c_str());
+      Serial.printf("↪ [TTS][probe] Content-Length: %ld\n", clen);
+
+      // 只读取前 512 字节用于判断（不打印大量二进制）
+      WiFiClient *stream = httpProbe.getStreamPtr();
+      if (stream) {
+        const int maxPeek = 512;
+        int availWait = 0;
+        while (!stream->available() && availWait < 20) { availWait++; delay(50); }
+        int toRead = min(maxPeek, stream->available());
+        if (toRead > 0) {
+          uint8_t buf[513];
+          int r = stream->read(buf, toRead);
+          if (r > 0) {
+            // 判断是否为文本（可打印）还是二进制
+            bool printable = true;
+            for (int i = 0; i < r; ++i) {
+              if (buf[i] < 9 || (buf[i] > 13 && buf[i] < 32)) { printable = false; break; }
+            }
+            if (printable) {
+              buf[r] = '\0';
+              Serial.println(F("↪ [TTS][probe] 响应前缀(文本):"));
+              Serial.println((char*)buf);
+            } else {
+              Serial.println(F("↪ [TTS][probe] 响应前缀(二进制 / 非文本)，以十六进制显示前 64 字节:"));
+              int hexShow = min(r, 64);
+              for (int i = 0; i < hexShow; ++i) {
+                Serial.printf("%02X ", buf[i]);
+                if ((i+1) % 16 == 0) Serial.println();
+              }
+              Serial.println();
+            }
+          }
+        } else {
+          Serial.println(F("↪ [TTS][probe] 流中无可读字节"));
+        }
+      }
+    } else {
+      String err = httpProbe.getString();
+      Serial.println(F("↪ [TTS][probe] 非200响应体片段:"));
+      if (err.length() > 512) Serial.println(err.substring(0,512)); else Serial.println(err);
+    }
+
+    httpProbe.end();
+    if (secureClient) delete secureClient; else if (baseClient) delete baseClient;
+  }
+  Serial.println(F("🔍 [TTS] HTTP 探测完成，开始正式打开流以播放"));
+  // --- end probe ---
+
   AudioHTTPSStream* httpsStream = nullptr;
   AudioFileSourceHTTPStream* httpStream = nullptr;
   AudioFileSource* file = nullptr;
 
-  if (url.startsWith("https://")) {
+  if (reqUrl.startsWith("https://")) {
     Serial.println(F("🔐 [TTS] 使用 HTTPS 流"));
     httpsStream = new AudioHTTPSStream();
     if (httpsStream == nullptr) {
@@ -943,9 +1095,9 @@ bool playMP3StreamFromURL(const String& url) {
     httpsStream->setTimeout(20000);
     httpsStream->setUserAgent(F("Mozilla/5.0 (ESP32-S3)"));
 
-    if (!httpsStream->open(url.c_str())) {
+    if (!httpsStream->open(reqUrl.c_str())) {
       Serial.println(F("❌ [TTS] 建立HTTPS音频流失败，尝试诊断..."));
-      httpsDiagnostic(url);
+      httpsDiagnostic(reqUrl);
       delete httpsStream;
       return false;
     }
@@ -958,7 +1110,7 @@ bool playMP3StreamFromURL(const String& url) {
       Serial.println(F("❌ [TTS] 分配HTTP流对象失败"));
       return false;
     }
-    if (!httpStream->open(url.c_str())) {
+    if (!httpStream->open(reqUrl.c_str())) {
       Serial.println(F("❌ [TTS] 建立HTTP音频流失败"));
       delete httpStream;
       return false;
@@ -1032,81 +1184,34 @@ bool playMP3StreamFromURL(const String& url) {
   return success;
 }
 
-bool requestAndPlayGoogleTTS(const String& text) {
-// ...existing code...
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
-    return false;
-  }
 
-  String limitedText = text;
-  if (limitedText.length() > 200) {
-    limitedText = limitedText.substring(0, 200);
-    Serial.println(F("ℹ️ [TTS] 文本过长，已截断至200字符"));
-  }
-
-  Serial.print(F("📝 [TTS] 谷歌TTS文本: "));
-  Serial.println(limitedText);
-
-  String encoded = urlEncode(limitedText);
-  String target = String("https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=zh-CN&q=") + encoded;
-  String url = target;
-  // 如果配置了代理，则把真实目标URL编码后作为代理参数
-  if (TTS_PROXY_URL != nullptr && strlen(TTS_PROXY_URL) > 0) {
-    String proxy = String(TTS_PROXY_URL);
-    // 代理约定：/tts_proxy?url=<encoded_target_url>
-    proxy += String("?url=") + urlEncode(target);
-    url = proxy;
-    Serial.printf("ℹ️ [TTS] 使用代理请求谷歌TTS: %s\n", proxy.c_str());
-  }
-
-  Serial.println(F("🌐 [TTS] 请求谷歌翻译TTS"));
-  return playMP3StreamFromURL(url);
-}
-
-bool requestAndPlayYoudaoTTS(const String& text) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
-    return false;
-  }
-
-  String limitedText = text;
-  if (limitedText.length() > 80) {
-    limitedText = limitedText.substring(0, 80);
-    Serial.println(F("ℹ️ [TTS] 文本过长，已截断至80字符"));
-  }
-
-  String encoded = urlEncode(limitedText);
-  String target = String("http://dict.youdao.com/dictvoice?type=2&audio=") + encoded;
-  String url = target;
-  if (TTS_PROXY_URL != nullptr && strlen(TTS_PROXY_URL) > 0) {
-    String proxy = String(TTS_PROXY_URL);
-    proxy += String("?url=") + urlEncode(target);
-    url = proxy;
-    Serial.printf("ℹ️ [TTS] 使用代理请求有道TTS: %s\n", proxy.c_str());
-  }
-
-  Serial.println(F("🌐 [TTS] 请求有道TTS"));
-  return playMP3StreamFromURL(url);
-}
 
 // 百度TTS provider（推荐通过本地代理，避免token管理和HTTPS问题）
 bool requestAndPlayBaiduTTS(const String& text) {
   // 如果配置了 BAIDU_API_KEY 与 SECRET，则优先在设备上直接获取 token 并直连百度（无需代理）
   // 直接优先：若配置了临时 access token 则直接使用；否则尝试设备获取 token 并直连
-  if (strlen(BAIDU_TTS_ACCESS_TOKEN) > 0) {
-    String limitedText = text;
-    if (limitedText.length() > 200) limitedText = limitedText.substring(0,200);
-    String encoded = urlEncode(limitedText);
-    String url = String("http://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + String(BAIDU_TTS_ACCESS_TOKEN) + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
-    Serial.printf("🔐 [Baidu] 使用 config 中的 access_token 请求 (token掩码=%s)\n", maskString(String(BAIDU_TTS_ACCESS_TOKEN)).c_str());
-    Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+  // chunk-level handler for Baidu (single chunk)
+  auto chunkFunc = [](const String &chunk)->bool{
+    if (strlen(BAIDU_TTS_ACCESS_TOKEN) > 0) {
+      String encoded = urlEncode(chunk);
+  String url = String("https://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + String(BAIDU_TTS_ACCESS_TOKEN) + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+      Serial.printf("🔐 [Baidu] 使用 config 中的 access_token 请求 (token掩码=%s)\n", maskString(String(BAIDU_TTS_ACCESS_TOKEN)).c_str());
+      Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
+      return playMP3StreamFromURL(url);
+    }
+    if (!fetchBaiduTokenIfNeeded()) {
+      Serial.println(F("✗ [Baidu] 无法获取 token，直接调用百度失败 (chunk)"));
+      return false;
+    }
+    String encoded = urlEncode(chunk);
+  String url = String("https://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + baidu_access_token + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+    Serial.printf("🔐 [Baidu] 设备直连请求 (token掩码=%s)\n", maskString(baidu_access_token).c_str());
     Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
     return playMP3StreamFromURL(url);
-  }
+  };
 
-  // 尝试设备端获取 token 并直连
-  return requestAndPlayBaiduTTS_OnDevice(text);
+  // Baidu supports longer texts; use a generous chunk size
+  return playTextInChunks(chunkFunc, text, 1024);
 }
 
 // 在设备上获取 token（HTTPS），并缓存
@@ -1169,28 +1274,32 @@ bool requestAndPlayBaiduTTS_OnDevice(const String& text) {
   }
   // 优先使用 config 中的临时 access token（用于快速测试）
   if (strlen(BAIDU_TTS_ACCESS_TOKEN) > 0) {
-    String limitedText = text;
-    if (limitedText.length() > 200) limitedText = limitedText.substring(0,200);
-    String encoded = urlEncode(limitedText);
-    String url = String("http://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + String(BAIDU_TTS_ACCESS_TOKEN) + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
-    Serial.printf("🔐 [Baidu] 使用 config 中的 access_token 请求 (token掩码=%s)\n", maskString(String(BAIDU_TTS_ACCESS_TOKEN)).c_str());
-    Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
-    Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
-    return playMP3StreamFromURL(url);
+    // 使用 config 中的 access token 时，也采用分段播放，避免截断长文本
+    auto chunkFunc = [](const String &chunk)->bool{
+      String encoded = urlEncode(chunk);
+  String url = String("https://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + String(BAIDU_TTS_ACCESS_TOKEN) + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+      Serial.printf("🔐 [Baidu] 使用 config 中的 access_token 请求 (token掩码=%s)\n", maskString(String(BAIDU_TTS_ACCESS_TOKEN)).c_str());
+      Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+      Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
+      return playMP3StreamFromURL(url);
+    };
+    return playTextInChunks(chunkFunc, text, 1024);
   }
 
   if (!fetchBaiduTokenIfNeeded()) {
     Serial.println(F("✗ [Baidu] 无法获取 token，直接调用百度失败"));
     return false;
   }
-  String limitedText = text;
-  if (limitedText.length() > 200) limitedText = limitedText.substring(0,200);
-  String encoded = urlEncode(limitedText);
-  String url = String("http://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + baidu_access_token + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
-  Serial.printf("🔐 [Baidu] 设备直连请求 (token掩码=%s)\n", maskString(baidu_access_token).c_str());
-  Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
-  Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
-  return playMP3StreamFromURL(url);
+  // 设备端获取到 token 后，按段播放完整文本（避免单次 200 字截断）
+  auto chunkFunc = [](const String &chunk)->bool{
+    String encoded = urlEncode(chunk);
+  String url = String("https://tsn.baidu.com/text2audio?tex=") + encoded + "&tok=" + baidu_access_token + "&cuid=ESP32CAM001&ctp=1&lan=zh&spd=5&pit=5&vol=7&per=0";
+    Serial.printf("🔐 [Baidu] 设备直连请求 (token掩码=%s)\n", maskString(baidu_access_token).c_str());
+    Serial.printf("🔋 [Baidu] 可用堆内存: %d bytes, 可用PSRAM: %d bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.printf("🌐 [Baidu] 请求 URL: %s\n", url.c_str());
+    return playMP3StreamFromURL(url);
+  };
+  return playTextInChunks(chunkFunc, text, 1024);
 }
 
 bool requestAndPlayEdgeTTS(const String& text) {
@@ -1198,64 +1307,19 @@ bool requestAndPlayEdgeTTS(const String& text) {
     Serial.println(F("❌ [TTS] WiFi未连接，无法请求TTS"));
     return false;
   }
-
-  String limitedText = text;
-  if (limitedText.length() > 200) {
-    limitedText = limitedText.substring(0, 200);
-    Serial.println(F("ℹ️ [TTS] 文本过长，已截断至200字符"));
-  }
-
-  String encoded = urlEncode(limitedText);
-  String target = String("https://tts-api-edge.vercel.app/api/tts?text=") + encoded + "&voice=zh-CN-XiaoxiaoNeural";
-  String url = target;
-  if (TTS_PROXY_URL != nullptr && strlen(TTS_PROXY_URL) > 0) {
-    String proxy = String(TTS_PROXY_URL);
-    proxy += String("?url=") + urlEncode(target);
-    url = proxy;
-    Serial.printf("ℹ️ [TTS] 使用代理请求Edge TTS: %s\n", proxy.c_str());
-  }
-
-  Serial.println(F("🌐 [TTS] 请求Edge TTS"));
-  return playMP3StreamFromURL(url);
+  return false; // Edge provider removed; keep stub to avoid link errors if referenced elsewhere
 }
 
 bool requestAndPlayTTS(const String& text) {
-  if (TTS_PROVIDER == nullptr) {
-    Serial.println(F("❌ [TTS] 未配置语音提供商"));
-    return false;
+  // 目前简化为仅使用百度 TTS
+  Serial.println(F("ℹ️ [TTS] 仅使用百度 TTS 进行语音合成"));
+  bool ok = requestAndPlayBaiduTTS(text);
+  if (ok) {
+    Serial.println(F("✅ [TTS] 由 baidu 成功播放"));
+  } else {
+    Serial.println(F("❌ [TTS] baidu 播放失败"));
   }
-
-  // 尝试顺序：首选提供商 -> Google -> Edge -> Youdao -> Baidu
-  const char* order[5];
-  int idx = 0;
-  order[idx++] = TTS_PROVIDER;
-  if (strcmp(TTS_PROVIDER, "google") != 0) order[idx++] = "google";
-  if (strcmp(TTS_PROVIDER, "edge") != 0) order[idx++] = "edge";
-  if (strcmp(TTS_PROVIDER, "youdao") != 0) order[idx++] = "youdao";
-  if (strcmp(TTS_PROVIDER, "baidu") != 0) order[idx++] = "baidu";
-
-  for (int i = 0; i < idx; ++i) {
-    const char* prov = order[i];
-    Serial.printf("ℹ️ [TTS] 尝试语音提供商: %s\n", prov);
-    bool ok = false;
-    if (strcmp(prov, "google") == 0) ok = requestAndPlayGoogleTTS(text);
-    else if (strcmp(prov, "edge") == 0) ok = requestAndPlayEdgeTTS(text);
-    else if (strcmp(prov, "youdao") == 0) ok = requestAndPlayYoudaoTTS(text);
-    else if (strcmp(prov, "baidu") == 0) ok = requestAndPlayBaiduTTS(text);
-    else {
-      Serial.printf("⚠️ [TTS] 未知提供商跳过: %s\n", prov);
-    }
-
-    if (ok) {
-      Serial.printf("✅ [TTS] 由 %s 成功播放\n", prov);
-      return true;
-    } else {
-      Serial.printf("✗ [TTS] %s 播放失败，尝试下一个提供商...\n", prov);
-    }
-  }
-
-  Serial.println(F("❌ [TTS] 所有语音提供商均失败"));
-  return false;
+  return ok;
 }
 
 // ==================== 执行完整的拍照分析流程 ====================
