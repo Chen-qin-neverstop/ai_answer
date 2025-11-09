@@ -19,6 +19,9 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include <ctype.h>
+#include <cstring>
+#include <stdlib.h>
 
 // ==================== I2S驱动兼容性处理 ====================
 // ESP32-S3 Arduino 3.x 使用新版I2S驱动API
@@ -371,6 +374,8 @@ bool initMicrophoneI2S() {
     },
   };
 
+  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
   err = i2s_channel_init_std_mode(mic_rx_handle, &std_cfg);
   if (err != ESP_OK) {
     Serial.printf("❌ 初始化I2S标准模式失败: %d\n", err);
@@ -430,6 +435,49 @@ void setupMicrophone() {
 }
 
 // ==================== 录音函数 (新I2S API) ====================
+static void logPcmStatistics(const int16_t* samples, size_t sampleCount) {
+  if (!samples || sampleCount == 0) {
+    Serial.println("🔍 [音频] 无PCM数据统计");
+    return;
+  }
+
+  int16_t minSample = 32767;
+  int16_t maxSample = -32768;
+  uint64_t sumAbs = 0;
+  size_t zeroCount = 0;
+
+  for (size_t i = 0; i < sampleCount; ++i) {
+    int16_t s = samples[i];
+    if (s < minSample) {
+      minSample = s;
+    }
+    if (s > maxSample) {
+      maxSample = s;
+    }
+    if (s == 0) {
+      ++zeroCount;
+    }
+    sumAbs += static_cast<uint16_t>(abs(s));
+  }
+
+  float avgAbs = sampleCount ? static_cast<float>(sumAbs) / sampleCount : 0.0f;
+  float zeroRatio = sampleCount ? (static_cast<float>(zeroCount) * 100.0f / sampleCount) : 0.0f;
+
+  Serial.printf("🔍 [音频] min=%d max=%d avg|x|=%.1f 零占比=%.1f%% 样本=%u\n",
+                minSample,
+                maxSample,
+                avgAbs,
+                zeroRatio,
+                static_cast<unsigned>(sampleCount));
+
+  Serial.print("🔍 [音频] 前20采样: ");
+  size_t preview = std::min<size_t>(20, sampleCount);
+  for (size_t i = 0; i < preview; ++i) {
+    Serial.printf("%d ", samples[i]);
+  }
+  Serial.println();
+}
+
 size_t recordAudio(uint8_t* buffer, size_t bufferSize, int durationSeconds) {
 #if !ENABLE_MICROPHONE
   Serial.println("❌ 录音功能已禁用(ENABLE_MICROPHONE=0)");
@@ -569,6 +617,51 @@ static String createAliyunSignatureNonce() {
   return String(part1) + String(part2);
 }
 
+static bool equalsIgnoreCase(const char* a, const char* b) {
+  if (!a || !b) {
+    return false;
+  }
+  while (*a && *b) {
+    if (tolower(static_cast<unsigned char>(*a)) != tolower(static_cast<unsigned char>(*b))) {
+      return false;
+    }
+    ++a;
+    ++b;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static bool isAliyunMetaKey(const char* key) {
+  if (!key) {
+    return false;
+  }
+
+  static const char* metaKeys[] = {
+      "header",      "headers",    "namespace",   "name",      "status",
+      "code",        "code_desc",  "message_id",  "request_id", "task_id",
+      "trace_id",    "event_id",   "app_key",     "token",      "token_id",
+      "biz_id",      "log",        "session_id",  "result_code", "message"};
+
+  for (const char* meta : metaKeys) {
+    if (equalsIgnoreCase(key, meta)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static String extractAliyunAsrText(JsonVariantConst node);
+
+static String extractAliyunFromArray(JsonArrayConst arr) {
+  for (JsonVariantConst child : arr) {
+    String text = extractAliyunAsrText(child);
+    if (text.length() > 0) {
+      return text;
+    }
+  }
+  return "";
+}
+
 // 尝试在阿里云ASR的多层响应结构中提取识别文本
 static String extractAliyunAsrText(JsonVariantConst node) {
   if (node.isNull()) {
@@ -576,19 +669,56 @@ static String extractAliyunAsrText(JsonVariantConst node) {
   }
 
   if (node.is<const char*>()) {
-    String text = node.as<const char*>();
+    const char* raw = node.as<const char*>();
+    if (!raw || raw[0] == '\0') {
+      return "";
+    }
+
+    String text = raw;
     text.trim();
+    if (text.length() == 0) {
+      return "";
+    }
+
+    // 忽略明显的标识/哈希值
+    bool looksHash = true;
+    if (text.length() == 32) {
+      for (size_t i = 0; i < text.length(); ++i) {
+        char c = text.charAt(i);
+        if (!isxdigit(static_cast<unsigned char>(c))) {
+          looksHash = false;
+          break;
+        }
+      }
+    } else if (text.length() == 36) {
+      // 形如 UUID: 8-4-4-4-12
+      const int hyphenPos[] = {8, 13, 18, 23};
+      looksHash = true;
+      for (int i = 0; i < text.length(); ++i) {
+        char c = text.charAt(i);
+        if ((i == hyphenPos[0] || i == hyphenPos[1] || i == hyphenPos[2] || i == hyphenPos[3])) {
+          if (c != '-') {
+            looksHash = false;
+            break;
+          }
+        } else if (!isxdigit(static_cast<unsigned char>(c))) {
+          looksHash = false;
+          break;
+        }
+      }
+    } else {
+      looksHash = false;
+    }
+
+    if (looksHash) {
+      return "";
+    }
+
     return text;
   }
 
   if (node.is<JsonArrayConst>()) {
-    for (JsonVariantConst child : node.as<JsonArrayConst>()) {
-      String text = extractAliyunAsrText(child);
-      if (text.length() > 0) {
-        return text;
-      }
-    }
-    return "";
+    return extractAliyunFromArray(node.as<JsonArrayConst>());
   }
 
   if (node.is<JsonObjectConst>()) {
@@ -596,9 +726,13 @@ static String extractAliyunAsrText(JsonVariantConst node) {
 
     // 常见字段优先检查
     const char* candidateKeys[] = {
-        "result", "text", "transcription", "transcript", "detokenized_result",
-        "payload", "data", "body", "NBest", "sentence", "Sentence", "value",
-        "best_transcription", "best_result"};
+        "payload",           "result",         "Result",       "text",
+        "Text",              "transcription",  "Transcript",   "transcript",
+        "detokenized_result", "nbest",         "NBest",        "details",
+        "Details",           "sentences",      "Sentences",    "sentence",
+        "Sentence",          "display_text",   "DisplayText",  "alternatives",
+        "Alternatives",      "final_result",   "FinalResult",  "best_transcription",
+        "best_result",       "Utterance"};
 
     for (const char* key : candidateKeys) {
       if (obj.containsKey(key)) {
@@ -611,6 +745,10 @@ static String extractAliyunAsrText(JsonVariantConst node) {
 
     // 兜底：遍历所有字段
     for (JsonPairConst kv : obj) {
+      const char* key = kv.key().c_str();
+      if (isAliyunMetaKey(key)) {
+        continue;
+      }
       String text = extractAliyunAsrText(kv.value());
       if (text.length() > 0) {
         return text;
@@ -749,6 +887,10 @@ static String recognizeSpeechWithAliyun(const uint8_t* audioData, size_t audioSi
 
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("X-NLS-Token", aliyun_asr_token);
+
+  const int16_t* pcmSamples = reinterpret_cast<const int16_t*>(audioData);
+  size_t pcmSampleCount = audioSize / sizeof(int16_t);
+  logPcmStatistics(pcmSamples, pcmSampleCount);
 
   int httpCode = http.POST(const_cast<uint8_t*>(audioData), audioSize);
   String response = "";
