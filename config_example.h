@@ -26,3 +26,5 @@ static const char* BAIDU_TTS_ACCESS_TOKEN = "";                       // 可选�
 
 // 语音唤醒
 static const char* CUSTOM_WAKE_WORD = "你好小智";  // 自定义唤醒词
+#define WAKE_ACK_ENABLED 0
+#define WAKE_ACK_TEXT "唤醒成功，请说出指令。"

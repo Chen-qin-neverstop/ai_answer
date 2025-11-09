@@ -168,7 +168,17 @@ const char* TTS_PROXY_URL = "";
 #define CUSTOM_WAKE_WORD "你好小智"
 #endif
 
+#ifndef WAKE_ACK_TEXT
+#define WAKE_ACK_TEXT "唤醒成功，请说出指令。"
+#endif
+
+#ifndef WAKE_ACK_ENABLED
+#define WAKE_ACK_ENABLED 1
+#endif
+
 static String wakeWord = String(CUSTOM_WAKE_WORD);
+static String wakeResponse = String(WAKE_ACK_TEXT);
+static bool voiceWakeBusy = false;
 
 // ==================== 阿里云ASR配置 ====================
 #ifndef ALIYUN_ASR_ACCESS_KEY_ID
@@ -217,7 +227,15 @@ static String wakeWord = String(CUSTOM_WAKE_WORD);
 #endif
 
 #ifndef WAKE_TIMEOUT_MS
-#define WAKE_TIMEOUT_MS (45000UL)
+#define WAKE_TIMEOUT_MS (60000UL)
+#endif
+
+#ifndef AUTO_WAKE_ENABLED
+#define AUTO_WAKE_ENABLED 1
+#endif
+
+#ifndef AUTO_WAKE_RETRY_DELAY_MS
+#define AUTO_WAKE_RETRY_DELAY_MS (2000UL)
 #endif
 
 constexpr size_t MIC_BYTES_PER_SAMPLE = MIC_BITS_PER_SAMPLE / 8;
@@ -1121,6 +1139,12 @@ bool performVoiceWakeFlow() {
   Serial.println("ℹ️ 如需启用,请修改代码中的 ENABLE_MICROPHONE 为 1");
   return false;
 #else
+  if (voiceWakeBusy) {
+    Serial.println("ℹ️ [唤醒] 监听已在进行，跳过重复请求");
+    return false;
+  }
+  voiceWakeBusy = true;
+
   Serial.println("\n\n****************************************");
   Serial.println("*     进入语音唤醒流程                 *");
   Serial.println("****************************************\n");
@@ -1128,17 +1152,25 @@ bool performVoiceWakeFlow() {
   bool wakeDetected = listenForWakeWord(wakeWord, WAKE_TIMEOUT_MS);
   if (!wakeDetected) {
     Serial.println("❌ [唤醒] 未检测到唤醒词，退出语音唤醒流程");
+    voiceWakeBusy = false;
     return false;
   }
 
-  playBeepTone(880, 180);
-  delay(250);
-  Serial.println("🎯 [唤醒] 唤醒成功，请在提示音后说出指令...");
+  if (WAKE_ACK_ENABLED && !wakeResponse.isEmpty()) {
+    Serial.printf("🔊 [唤醒] 播放提示语: %s\n", wakeResponse.c_str());
+    speakText(wakeResponse);
+  } else {
+    playBeepTone(880, 180);
+    delay(200);
+  }
+
+  Serial.println("🎯 [唤醒] 唤醒成功，请说出指令...");
   delay(300);
   bool analysisOk = performVoiceAnalysis();
   if (!analysisOk) {
     Serial.println("❌ [唤醒] 语音唤醒后分析失败");
   }
+  voiceWakeBusy = false;
   return analysisOk;
 #endif
 }
@@ -2836,6 +2868,25 @@ void setup() {
 
 void loop() {
   checkButtonTrigger();
+
+#if AUTO_WAKE_ENABLED
+  static bool wakeInProgress = false;
+  static unsigned long nextWakeStart = 0;
+
+  if (!wakeInProgress && millis() >= nextWakeStart) {
+    if (voiceWakeBusy) {
+      nextWakeStart = millis() + AUTO_WAKE_RETRY_DELAY_MS;
+    } else {
+      wakeInProgress = true;
+      bool wakeSuccess = performVoiceWakeFlow();
+      if (!wakeSuccess) {
+        Serial.println("ℹ️ [自动唤醒] 监听结束，1分钟内未检测到唤醒词");
+      }
+      nextWakeStart = millis() + AUTO_WAKE_RETRY_DELAY_MS;
+      wakeInProgress = false;
+    }
+  }
+#endif
 
   delay(10);
 }
