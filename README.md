@@ -1,5 +1,7 @@
 # ESP32-S3 CAM AI视觉智能问答机
 
+> ✅ **2025-01-09 更新**: I2S驱动冲突问题已解决！麦克风功能已使用新I2S API重写，现可与TTS播放完美共存。
+
 ## 项目概述
 基于果云ESP32-S3 CAM开发板的AI视觉智能问答系统，能够实时拍摄图像并通过视觉大模型分析图像内容，最终通过语音播报分析结果。
 
@@ -38,157 +40,170 @@ LED_GPIO_NUM:   2     // 板载LED
 - `fb_count`: 2 (双缓冲)
 - `xclk_freq_hz`: 20MHz
 
-### 2. WiFi网络模块 (WiFi Module)
-**文件位置**: `AI_Answer.ino` - `setup()`
-**功能描述**:
-- 连接到指定WiFi网络
-- 获取IP地址用于Web访问
-- 监控WiFi连接状态和信号强度
-- 禁用WiFi休眠以提高响应速度
+### 2. 麦克风模块 (Microphone Module) ✅ **已修复**
+**文件位置**: `AI_Answer.ino` - `setupMicrophone()` / `recordAudio()`
+**状态**: ✅ **正常工作** - 已使用ESP32-S3新版I2S标准模式驱动重写
 
-**配置参数**:
+**技术升级**:
+- ✅ 使用新I2S API (`driver/i2s_std.h`)替代旧版API
+- ✅ 与ESP8266Audio库的TTS播放功能完全兼容，无冲突
+- ✅ 采用按需初始化/释放策略，优化资源使用
+
+**功能描述**:
+- 初始化I2S麦克风输入
+- 录音音频数据到内存缓冲区
+- 支持16位单声道16kHz采样率
+- 支持语音唤醒和语音识别功能
+
+**引脚定义**:
 ```cpp
-const char* ssid = "你的WiFi名称";
-const char* password = "你的WiFi密码";
+MIC_I2S_BCLK_PIN: 47  // I2S位时钟
+MIC_I2S_LRC_PIN:  45  // I2S左右时钟
+MIC_I2S_DIN_PIN:  48  // I2S数据输入
 ```
 
-### 3. Web服务器模块 (Web Server Module)
-**文件位置**: `AI_Answer.ino` - `startCameraServer()`
+**关键参数**:
+- `sample_rate`: 16000 Hz
+- `bits_per_sample`: 16位
+- `channels`: 1 (单声道)
+- `buffer_size`: 8192字节
+
+### 3. 语音识别模块 (Speech Recognition) ✅
+**文件位置**: `AI_Answer.ino` - `recognizeSpeech()`
+**状态**: ✅ 完全可用 (默认阿里云)
 **功能描述**:
-提供三个HTTP端点:
+- 调用阿里云短语音识别API (NLS Gateway)
+- 自动申请并缓存阿里云临时Token
+- 上传PCM音频并解析识别结果
+- 识别失败时返回空结果并打印错误
 
-#### 3.1 主页面 `/`
-- 提供可视化Web界面
-- 响应式设计，支持移动设备
-- 实时视频流预览
-- 拍照和下载功能
-
-#### 3.2 视频流端点 `/stream`
-- 实现MJPEG视频流
-- 使用multipart/x-mixed-replace协议
-- 分块传输避免内存溢出
-- 帧率约60fps（受网络和处理能力影响）
-
-#### 3.3 拍照端点 `/capture`
-- 单次图像捕获
-- 返回JPEG格式图片
-- 支持浏览器直接下载
-- 分块传输大图片（4KB块）
-
-### 4. Base64编码模块 (Base64 Encoder)
-**文件位置**: `AI_Answer.ino` - `encodeBase64()`
-**功能描述**:
-- 将相机捕获的JPEG图像编码为Base64字符串
-- 用于API调用时嵌入图片数据
-- 优化内存使用，分块编码
-
-**实现细节**:
-- 输入: `camera_fb_t*` 帧缓冲指针
-- 输出: `String` Base64编码字符串
-- 使用mbedtls库的base64编码函数
-
-### 5. 视觉大模型API模块 (Vision AI API)
-**文件位置**: `AI_Answer.ino` - `callVisionAPI()`
-**功能描述**:
-- 调用多模态视觉大模型API
-- 支持多种API提供商（OpenAI、通义千问等）
-- 发送Base64编码图片
-- 接收并解析JSON格式的AI回复
-
-**支持的API**:
-1. **OpenAI GPT-4 Vision API**
-   - Endpoint: `https://api.openai.com/v1/chat/completions`
-   - Model: `gpt-4-vision-preview`
-   
-2. **阿里云通义千问 Vision API**
-   - Endpoint: `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`
-   - Model: `qwen-vl-plus`
-
-3. **其他兼容OpenAI格式的API**
-   - 支持自定义endpoint和API密钥
-
-**配置参数**:
+**API配置**:
 ```cpp
-const char* API_KEY = "你的API密钥";
-const char* API_ENDPOINT = "API地址";
-const char* API_MODEL = "模型名称";
+#define BAIDU_ASR_API_KEY "你的百度ASR API Key"
+#define BAIDU_ASR_SECRET_KEY "你的百度ASR Secret Key"
+#define BAIDU_ASR_APP_ID "你的百度ASR App ID"
 ```
 
-**请求格式** (OpenAI格式):
-```json
-{
-  "model": "gpt-4-vision-preview",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "请描述这张图片中的内容"},
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-      ]
-    }
-  ],
-  "max_tokens": 300
-}
-```
+**支持格式**:
+- 音频格式: PCM
+- 采样率: 16kHz
+- 位深度: 16位
+- 声道: 单声道
 
-### 6. JSON解析模块 (JSON Parser)
-**文件位置**: `AI_Answer.ino` - `parseVisionResponse()`
+### 4. 提示词生成模块 (Prompt Generation)
+**文件位置**: `AI_Answer.ino` - `generatePromptFromSpeech()`
 **功能描述**:
-- 解析API返回的JSON响应
-- 提取AI生成的图像描述文本
-- 错误处理和状态码检查
+- 将语音识别结果转换为视觉AI提示词
+- 直接使用用户的语音命令作为AI分析的指导
 
-**依赖库**: ArduinoJson
+**示例**:
+输入语音: "描述一下这张图片中的人"
+输出提示词: "用户命令：描述一下这张图片中的人\n\n请根据用户的命令分析当前图片,并用中文详细回答。"
 
-### 7. 串口输出模块 (Serial Output)
-**文件位置**: `AI_Answer.ino` - `outputToSerial()`
+### 5. 语音唤醒模块 (Voice Wake-up) ✅
+**文件位置**: `AI_Answer.ino` - `listenForWakeWord()`, `performVoiceWakeFlow()`
+**状态**: ✅ 完全可用
 **功能描述**:
-- 将AI分析结果输出到串口监视器
-- 用于调试和测试
-- 显示完整的对话流程
+- 持续监听预设的唤醒词
+- 检测到唤醒词后自动进入语音分析流程
+- 支持自定义唤醒词配置
 
-**波特率**: 115200
-
-### 8. 语音输出模块 (Audio Output)
-**文件位置**: `AI_Answer.ino` - `speakText()` / `requestAndPlayBaiduTTS()`
-**当前实现**:
-- 优先使用百度 TTS（直接从设备请求或使用本地配置的 access token）。
-- 支持 MP3 流在线播放，使用 I2S 输出和 `AudioGeneratorMP3` 解码。
-- 已添加详细串口日志用于诊断（见“诊断与日志”部分）。
-
-**如何配置百度 TTS（直接调用）**:
-1. 在 `config_local.h` 中设置以下项（用于设备端获取 token）:
+**唤醒词配置**:
+在 `config_local.h` 中设置:
 ```cpp
-#define BAIDU_API_KEY "你的百度API Key"
-#define BAIDU_SECRET_KEY "你的百度Secret Key"
+static const char* CUSTOM_WAKE_WORD = "你好小智";  // 可修改为任意短语
 ```
-2. 可选：为了快速测试，可以直接在 `config_local.h` 中设置一个临时的 `BAIDU_TTS_ACCESS_TOKEN`：
+
+**关键参数**:
 ```cpp
-#define BAIDU_TTS_ACCESS_TOKEN "临时token"
+WAKE_LISTEN_SECONDS: 2        // 每次监听时长(秒)
+WAKE_TIMEOUT_MS: 45000        // 唤醒超时时间(毫秒)
+VOICE_COMMAND_SECONDS: 5      // 命令录音时长(秒)
 ```
-3. 生产环境推荐留空 `BAIDU_TTS_ACCESS_TOKEN`，设备会在运行时通过 `openapi.baidu.com/oauth/2.0/token` 获取并缓存 token。
 
-**注意**: 设备需能够访问 `openapi.baidu.com` (HTTPS，用于 token)，以及 `tsn.baidu.com` (HTTP，用于拉取 MP3 流)。如果网络受限，请参阅“代理/备用方案”。
+**工作流程**:
+1. **进入唤醒模式**: 长按语音按钮(>1.5秒)或Web触发
+2. **循环监听**: 每2秒录音一次,识别是否包含唤醒词
+3. **检测成功**: 播放提示音,提示用户说出指令
+4. **录音指令**: 录音5秒捕获用户的语音命令
+5. **执行分析**: 自动进入语音分析流程
 
-### 9. 触发控制模块 (Trigger Control)
-**文件位置**: `AI_Answer.ino` - `checkTrigger()`
+### 6. 语音分析工作流程 (Voice Analysis Workflow)
+**文件位置**: `AI_Answer.ino` - `performVoiceAnalysis()`
 **功能描述**:
-- 检测触发条件（按钮/定时）
-- 执行完整的拍照→分析→输出流程
-- 防抖处理
+- 完整语音输入到输出的工作流程
+- 录音 → 语音识别 → 提示词生成 → 视觉AI分析 → TTS输出
 
-**触发方式**:
-1. **按钮触发**: 连接物理按钮到GPIO
-2. **定时触发**: 按设定间隔自动拍照
-3. **Web触发**: 通过Web界面手动触发
-4. **串口触发**: 通过串口命令触发
+**工作流程**:
+1. **录音阶段**: 录音5秒音频数据到缓冲区
+2. **识别阶段**: 调用百度ASR API识别语音内容
+3. **生成阶段**: 将识别结果转换为视觉AI提示词
+4. **分析阶段**: 调用视觉AI模型分析当前摄像头图像
+5. **输出阶段**: 通过TTS将分析结果转换为语音输出
+
+### 6. TTS语音合成模块 (Text-to-Speech)
+**文件位置**: `AI_Answer.ino` - `performTTS()`
+**功能描述**:
+- 调用百度TTS API生成语音
+- 将文本转换为音频流并通过I2S扬声器播放
+
+**优化特性**:
+- **分块处理**: 长文本自动分割为小块，避免爆鸣
+- **增益控制**: 动态调整音量防止失真
+- **生命周期管理**: 正确初始化和清理I2S资源
+
+**引脚定义**:
+```cpp
+SPEAKER_I2S_BCLK_PIN: 41  // I2S位时钟
+SPEAKER_I2S_LRC_PIN:  42  // I2S左右时钟
+SPEAKER_I2S_DOUT_PIN: 40  // I2S数据输出
+```
+
+## 控制接口 (Control Interfaces)
+
+### 1. 物理按钮控制 (Physical Button Control)
+**文件位置**: `AI_Answer.ino` - `checkButtonTrigger()`
+**功能描述**:
+- 检测GPIO按钮按下事件
+- 支持视觉分析和语音分析两种模式
+
+**按钮配置**:
+```cpp
+TRIGGER_BUTTON_PIN: 0   // 视觉分析按钮
+VOICE_BUTTON_PIN:  1   // 语音分析按钮
+```
+
+**触发逻辑**:
+- **短按(<1.5秒)语音按钮**: 直接执行语音分析流程
+- **长按(>1.5秒)语音按钮**: 进入语音唤醒模式
+- **按视觉分析按钮**: 执行视觉分析流程
+- 支持防抖处理避免误触发
+
+### 2. Web界面控制 (Web Interface Control)
+**文件位置**: `AI_Answer.ino` - Web服务器处理函数
+**功能描述**:
+- 提供HTTP Web界面进行远程控制
+- 支持视觉分析和语音分析两种模式
+
+**API端点**:
+- `GET /`: 主页，显示控制界面
+- `GET /analyze`: 执行视觉分析
+- `POST /ai_analyze`: 执行AI视觉分析并返回JSON结果
+- `POST /voice_analyze`: 执行语音分析流程
+- `POST /voice_wake`: 执行语音唤醒流程
+
+**界面特性**:
+- 响应式设计，适配移动设备
+- 实时状态显示
+- 按钮点击触发分析流程
 
 ## 系统工作流程
 
+### 视觉分析流程
 ```
 [开机启动]
     ↓
-[初始化摄像头] → [连接WiFi] → [启动Web服务器]
+[初始化摄像头] → [初始化麦克风] → [连接WiFi] → [启动Web服务器]
     ↓
 [等待触发]
     ↓
@@ -200,7 +215,51 @@ const char* API_MODEL = "模型名称";
     ↓
 [解析JSON响应]
     ↓
-[串口输出结果] → [语音播报(预留)]
+[串口输出结果] → [语音播报]
+    ↓
+[返回等待触发]
+```
+
+### 语音分析流程
+```
+[语音触发]
+    ↓
+[录音5秒音频] ← 按钮短按/Web触发
+    ↓
+[调用百度ASR API]
+    ↓
+[解析语音识别结果]
+    ↓
+[生成视觉AI提示词]
+    ↓
+[捕获当前图像]
+    ↓
+[调用视觉AI API]
+    ↓
+[解析分析结果]
+    ↓
+[语音播报结果]
+    ↓
+[返回等待触发]
+```
+
+### 语音唤醒流程
+```
+[语音唤醒触发]
+    ↓
+[进入唤醒模式] ← 按钮长按/Web触发
+    ↓
+[循环监听唤醒词] ← 每2秒录音识别
+    ↓
+[检测到唤醒词?] → 否 → [继续监听直到超时]
+    ↓ 是
+[播放提示音]
+    ↓
+[提示用户说出指令]
+    ↓
+[录音5秒捕获命令]
+    ↓
+[执行语音分析流程]
     ↓
 [返回等待触发]
 ```
@@ -304,9 +363,29 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 - **定时触发**: 在代码中设置定时间隔
 - **串口触发**: 发送命令 `ANALYZE` 到串口
 
-### 3. 查看结果
+### 3. AI语音分析
+- **Web触发**: 在Web界面点击"语音分析"按钮
+- **按钮触发**: 短按连接到GPIO1的语音按钮(<1.5秒)
+- **工作流程**: 录音5秒 → 语音识别 → 生成提示词 → 视觉分析 → 语音输出
+
+### 4. AI语音唤醒
+- **Web触发**: 在Web界面点击"语音唤醒"按钮
+- **按钮触发**: 长按连接到GPIO1的语音按钮(>1.5秒)
+- **工作流程**: 
+  1. 进入唤醒模式,循环监听"你好小智"(可自定义)
+  2. 检测到唤醒词后播放提示音
+  3. 录音5秒捕获用户指令
+  4. 自动执行语音分析流程
+
+**唤醒词配置**:
+在 `config_local.h` 中修改:
+```cpp
+static const char* CUSTOM_WAKE_WORD = "你好小智";  // 改为你想要的唤醒词
+```
+
+### 5. 查看结果
 - **串口输出**: 打开串口监视器查看AI返回的文字描述
-- **语音播报**: (未来) 通过扬声器播放
+- **语音播报**: 通过扬声器播放分析结果
 
 ## 故障排除
 
@@ -398,17 +477,20 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 1. ✅ 添加物理按钮触发
 2. ✅ 实现定时自动拍照
 3. ✅ 支持多种API切换
-4. ⏳ 添加本地图像预处理
-5. ⏳ 实现简单的语音播报
+4. ✅ 实现语音唤醒功能
+5. ✅ 支持自定义唤醒词
+6. ⏳ 添加本地图像预处理
+7. ⏳ 实现更多TTS提供商支持
 
 ### 长期扩展
 1. 🔲 集成本地AI模型（TensorFlow Lite）
 2. 🔲 添加物体识别和跟踪
 3. 🔲 实现实时视频分析
 4. 🔲 添加人脸识别功能
-5. 🔲 支持语音唤醒和语音指令
+5. 🔲 支持多唤醒词和自然对话
 6. 🔲 添加LCD屏幕显示结果
 7. 🔲 实现边缘计算和云端协同
+8. 🔲 支持离线语音识别
 
 ## 版本历史
 
@@ -422,6 +504,23 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 - ✅ 添加Base64图像编码
 - ✅ 集成视觉大模型API
 
+### v2.3.0 (2025-11-06)
+- ✅ 添加语音唤醒功能
+- ✅ 支持自定义唤醒词配置
+- ✅ 实现长按/短按按钮区分不同功能
+- ✅ 添加语音唤醒Web界面控制
+- ✅ 优化提示词生成逻辑(直接使用用户命令)
+- ✅ 修复Base64编码函数调用错误
+- ✅ 更新文档添加语音唤醒说明
+
+### v2.2.0 (2025-01-XX)
+- ✅ 添加麦克风音频输入模块
+- ✅ 集成百度语音识别API
+- ✅ 实现语音到提示词转换
+- ✅ 添加语音分析工作流程
+- ✅ 支持物理按钮和Web界面语音触发
+- ✅ 更新README文档
+
 ### v2.1.0 (2025-10-19)
 - ✅ 切换为优先直接调用百度TTS（支持设备端获取 token 或使用 config 中的临时 token）
 - ✅ 增强 TTS 与 token 相关的串口诊断日志（掩码显示 token、打印响应片段与内存信息）
@@ -431,8 +530,9 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 - ⏳ 预留语音输出接口
 
 ### 未来版本
-- 🔲 v2.1: 完整实现语音输出
-- 🔲 v2.2: 添加本地图像处理
+- 🔲 v2.4: 优化语音识别准确率
+- 🔲 v2.5: 支持阿里云ASR实现
+- 🔲 v2.6: 添加多唤醒词支持
 - 🔲 v3.0: 集成边缘AI模型
 
 ## 引脚使用总结
@@ -446,9 +546,15 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 | 摄像头VSYNC | 6 | 垂直同步 |
 | 摄像头HREF | 7 | 水平参考 |
 | 摄像头PCLK | 13 | 像素时钟 |
+| 麦克风BCLK | 47 | I2S位时钟 |
+| 麦克风LRC | 45 | I2S左右时钟 |
+| 麦克风DIN | 48 | I2S数据输入 |
+| 扬声器BCLK | 41 | I2S位时钟 |
+| 扬声器LRC | 42 | I2S左右时钟 |
+| 扬声器DOUT | 40 | I2S数据输出 |
 | 板载LED | 2 | 状态指示 |
-| 按钮(预留) | 0 | 触发拍照 |
-| I2S音频(预留) | TBD | 扬声器输出 |
+| 视觉分析按钮 | 0 | 触发视觉分析 |
+| 语音分析按钮 | 1 | 触发语音分析 |
 
 ## 技术支持
 
@@ -479,4 +585,4 @@ const char* QWEN_MODEL = "qwen-vl-plus";
 4. PSRAM必须启用，否则无法运行
 5. 建议使用稳定的WiFi网络
 
-**最后更新**: 2025-10-07
+**最后更新**: 2025-11-06

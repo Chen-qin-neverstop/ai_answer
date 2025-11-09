@@ -16,3 +16,13 @@ static const char* CUSTOM_API_KEY = "sk-your-custom-key";   // 其他兼容OpenA
 static const char* ALIYUN_TTS_APPKEY    = "your-aliyun-tts-appkey";  // 阿里云TTS
 static const char* BAIDU_TTS_API_KEY    = "your-baidu-api-key";      // 百度TTS（可选）
 static const char* BAIDU_TTS_SECRET_KEY = "your-baidu-secret-key";   // 百度TTS（可选）
+static const char* BAIDU_TTS_ACCESS_TOKEN = "";                       // 可选：设备直接调用时的临时token
+
+// ==================== 阿里云语音识别 ====================
+#define ALIYUN_ASR_ACCESS_KEY_ID     "your-aliyun-asr-access-key-id"
+#define ALIYUN_ASR_ACCESS_KEY_SECRET "your-aliyun-asr-access-key-secret"
+#define ALIYUN_ASR_APP_KEY           "your-aliyun-asr-app-key"
+#define ALIYUN_ASR_REGION            "cn-shanghai"
+
+// 语音唤醒
+static const char* CUSTOM_WAKE_WORD = "你好小智";  // 自定义唤醒词

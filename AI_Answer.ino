@@ -7,6 +7,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
+#include "mbedtls/md.h"
 #include <math.h>
 #include <time.h>
 #include <AudioFileSourceHTTPStream.h>
@@ -17,6 +18,18 @@
 #include <AudioFileSourceSPIFFS.h>
 #include <vector>
 #include <functional>
+#include <algorithm>
+
+// ==================== I2S驱动兼容性处理 ====================
+// ESP32-S3 Arduino 3.x 使用新版I2S驱动API
+// 新API与ESP8266Audio库兼容,可以同时使用录音和播放功能
+//
+#define ENABLE_MICROPHONE 1  // 设为1启用麦克风,设为0禁用
+
+#if ENABLE_MICROPHONE
+  #include <driver/i2s_std.h>
+  #include <driver/gpio.h>
+#endif
 
 // 简单的 HTTPS 诊断工具：打印响应码和前 200 字节（用于调试Edge TTS等服务）
 void httpsDiagnostic(const String &url) {
@@ -139,11 +152,39 @@ const char* TTS_PROVIDER = "baidu";
 static String baidu_access_token = "";
 static unsigned long baidu_token_expires_ms = 0;
 
+static String aliyun_asr_token = "";
+static long long aliyun_token_expire_unix = 0;
+
 // 可选代理: 如果设备无法直接访问外部TTS（网络/防火墙问题），
 // 可以在本地或VPS上运行一个简单的HTTP代理，将真实TTS请求由代理发出并返回音频。
 // 例: "http://192.168.1.100:3000/tts_proxy" 或 "http://your-vps:3000/tts_proxy"
 // 置为空字符串表示不使用代理。
 const char* TTS_PROXY_URL = "";
+
+#ifndef CUSTOM_WAKE_WORD
+#define CUSTOM_WAKE_WORD "你好小智"
+#endif
+
+static String wakeWord = String(CUSTOM_WAKE_WORD);
+
+// ==================== 阿里云ASR配置 ====================
+#ifndef ALIYUN_ASR_ACCESS_KEY_ID
+#define ALIYUN_ASR_ACCESS_KEY_ID ""
+#endif
+#ifndef ALIYUN_ASR_ACCESS_KEY_SECRET
+#define ALIYUN_ASR_ACCESS_KEY_SECRET ""
+#endif
+#ifndef ALIYUN_ASR_APP_KEY
+#define ALIYUN_ASR_APP_KEY ""
+#endif
+#ifndef ALIYUN_ASR_REGION
+#define ALIYUN_ASR_REGION "cn-shanghai"
+#endif
+
+// ==================== ASR服务选择 ====================
+#define ASR_PROVIDER_BAIDU  0
+#define ASR_PROVIDER_ALIYUN 1
+#define ASR_PROVIDER        ASR_PROVIDER_ALIYUN  // 选择ASR服务提供商
 
 // ==================== I2S 音频输出配置 ====================
 #define I2S_BCLK_PIN    21
@@ -155,11 +196,41 @@ const char* TTS_PROXY_URL = "";
 #define AUDIO_BITS_PER_SAMPLE 16
 #define AUDIO_CHANNELS        1
 
+// ==================== I2S 麦克风输入配置 ====================
+#define MIC_I2S_BCLK_PIN    47  // 根据硬件调整
+#define MIC_I2S_LRC_PIN     45  // 根据硬件调整
+#define MIC_I2S_DIN_PIN     48  // 根据硬件调整
+#define MIC_I2S_NUM         I2S_NUM_1
+
+#define MIC_SAMPLE_RATE      16000
+#define MIC_BITS_PER_SAMPLE  16
+#define MIC_CHANNELS         1
+#ifndef VOICE_COMMAND_SECONDS
+#define VOICE_COMMAND_SECONDS 5
+#endif
+
+#ifndef WAKE_LISTEN_SECONDS
+#define WAKE_LISTEN_SECONDS 2
+#endif
+
+#ifndef WAKE_TIMEOUT_MS
+#define WAKE_TIMEOUT_MS (45000UL)
+#endif
+
+constexpr size_t MIC_BYTES_PER_SAMPLE = MIC_BITS_PER_SAMPLE / 8;
+constexpr size_t MIC_BYTES_PER_SECOND = static_cast<size_t>(MIC_SAMPLE_RATE) * MIC_BYTES_PER_SAMPLE * MIC_CHANNELS;
+constexpr size_t VOICE_COMMAND_BUFFER_BYTES = MIC_BYTES_PER_SECOND * VOICE_COMMAND_SECONDS;
+constexpr size_t WAKE_WORD_BUFFER_BYTES = MIC_BYTES_PER_SECOND * WAKE_LISTEN_SECONDS;
+
 // 触发按钮配置
 #define TRIGGER_BUTTON_PIN 0
+#define VOICE_BUTTON_PIN 1  // 新增语音输入按钮
 bool lastButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;
+bool lastVoiceButtonState = HIGH;
+unsigned long lastVoiceDebounceTime = 0;
+unsigned long voiceButtonPressStart = 0;
 
 // 果云ESP32-S3 CAM引脚定义
 #define PWDN_GPIO_NUM  -1
@@ -181,6 +252,17 @@ const unsigned long debounceDelay = 50;
 #define PCLK_GPIO_NUM  13
 
 #define LED_GPIO_NUM   2
+
+// ==================== 函数前置声明 ====================
+// 这些函数在文件后面定义,但在前面的代码中会被调用,需要先声明
+String encodeBase64(const uint8_t* data, size_t length);
+bool fetchBaiduTokenIfNeeded();
+bool playBeepTone(int frequency, int durationMs);
+bool performVoiceAnalysis();
+void performVisionAnalysis();
+void outputToSerial(String aiResponse);
+bool downloadMP3ToSPIFFS(const String& url, const String& filepath);
+bool playMP3FromSPIFFS(const String& filepath);
 
 httpd_handle_t camera_httpd = NULL;
 
@@ -243,6 +325,739 @@ void setupCamera() {
     s->set_dcw(s, 1);
     s->set_colorbar(s, 0);
   }
+}
+
+// ==================== 麦克风初始化(新I2S API) ====================
+// 使用ESP32-S3新版I2S标准模式驱动,与ESP8266Audio库兼容
+
+#if ENABLE_MICROPHONE
+
+// 全局I2S句柄
+static i2s_chan_handle_t mic_rx_handle = NULL;
+
+bool initMicrophoneI2S() {
+  if (mic_rx_handle != NULL) {
+    Serial.println("ℹ️ 麦克风I2S已初始化,跳过重复安装");
+    return true;
+  }
+
+  // 1. 创建I2S通道配置
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+  chan_cfg.auto_clear = false;
+  chan_cfg.dma_desc_num = 4;
+  chan_cfg.dma_frame_num = 1024;
+  
+  esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &mic_rx_handle);
+  if (err != ESP_OK) {
+    Serial.printf("❌ 创建I2S RX通道失败: %d\n", err);
+    return false;
+  }
+
+  // 2. 配置I2S标准模式
+  i2s_std_config_t std_cfg = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)MIC_I2S_BCLK_PIN,
+      .ws   = (gpio_num_t)MIC_I2S_LRC_PIN,
+      .dout = I2S_GPIO_UNUSED,
+      .din  = (gpio_num_t)MIC_I2S_DIN_PIN,
+      .invert_flags = {
+        .mclk_inv = false,
+        .bclk_inv = false,
+        .ws_inv   = false,
+      },
+    },
+  };
+
+  err = i2s_channel_init_std_mode(mic_rx_handle, &std_cfg);
+  if (err != ESP_OK) {
+    Serial.printf("❌ 初始化I2S标准模式失败: %d\n", err);
+    i2s_del_channel(mic_rx_handle);
+    mic_rx_handle = NULL;
+    return false;
+  }
+
+  // 3. 启用I2S通道
+  err = i2s_channel_enable(mic_rx_handle);
+  if (err != ESP_OK) {
+    Serial.printf("❌ 启用I2S通道失败: %d\n", err);
+    i2s_del_channel(mic_rx_handle);
+    mic_rx_handle = NULL;
+    return false;
+  }
+
+  Serial.println("✓ 麦克风I2S驱动已初始化(新API)");
+  return true;
+}
+
+void deinitMicrophoneI2S() {
+  if (mic_rx_handle == NULL) {
+    return;
+  }
+
+  i2s_channel_disable(mic_rx_handle);
+  i2s_del_channel(mic_rx_handle);
+  mic_rx_handle = NULL;
+  Serial.println("✓ 麦克风I2S驱动已卸载");
+}
+
+#else
+
+// 麦克风功能已禁用
+static i2s_chan_handle_t mic_rx_handle = NULL;
+
+bool initMicrophoneI2S() {
+  Serial.println("⚠️ 麦克风功能已禁用(ENABLE_MICROPHONE=0)");
+  return false;
+}
+
+void deinitMicrophoneI2S() {
+  // 空函数
+}
+
+#endif
+
+// 空函数保持向后兼容
+void setupMicrophone() {
+#if ENABLE_MICROPHONE
+  Serial.println("ℹ️ 麦克风采用按需初始化策略");
+#else
+  Serial.println("⚠️ 麦克风功能已禁用(ENABLE_MICROPHONE=0)");
+  Serial.println("ℹ️ 如需启用,请修改代码中的 ENABLE_MICROPHONE 为 1");
+#endif
+}
+
+// ==================== 录音函数 (新I2S API) ====================
+size_t recordAudio(uint8_t* buffer, size_t bufferSize, int durationSeconds) {
+#if !ENABLE_MICROPHONE
+  Serial.println("❌ 录音功能已禁用(ENABLE_MICROPHONE=0)");
+  Serial.println("ℹ️ 如需启用,请修改代码中的 ENABLE_MICROPHONE 为 1");
+  return 0;
+#else
+  if (!buffer) {
+    Serial.println("❌ 录音失败：缓冲区指针无效");
+    return 0;
+  }
+
+  const size_t targetBytes = MIC_BYTES_PER_SECOND * durationSeconds;
+  if (targetBytes == 0) {
+    Serial.println("⚠️ 录音目标长度为0，直接返回");
+    return 0;
+  }
+
+  if (targetBytes > bufferSize) {
+    Serial.printf("❌ 缓冲区大小不足：需要 %u 字节，实际 %u 字节\n",
+                  static_cast<unsigned>(targetBytes), static_cast<unsigned>(bufferSize));
+    return 0;
+  }
+
+  // 录音前初始化I2S驱动
+  if (!initMicrophoneI2S()) {
+    Serial.println("❌ 麦克风I2S初始化失败");
+    return 0;
+  }
+
+  Serial.printf("🎤 开始录音 %d 秒（目标 %u 字节）...\n", durationSeconds, static_cast<unsigned>(targetBytes));
+
+  size_t bytesRead = 0;
+  unsigned long startTime = millis();
+  const unsigned long maxDurationMs = durationSeconds * 1300UL;
+
+  while (bytesRead < targetBytes) {
+    size_t chunkSize = std::min<size_t>(4096, targetBytes - bytesRead);
+    size_t bytesCaptured = 0;
+    
+    // 使用新I2S API读取数据
+    esp_err_t result = i2s_channel_read(mic_rx_handle,
+                                        buffer + bytesRead,
+                                        chunkSize,
+                                        &bytesCaptured,
+                                        1000);
+
+    if (result != ESP_OK) {
+      Serial.printf("❌ I2S读取失败: %d\n", result);
+      break;
+    }
+
+    if (bytesCaptured == 0) {
+      if (millis() - startTime > maxDurationMs) {
+        Serial.println("⚠️ 录音超时，未捕获到新的音频数据");
+        break;
+      }
+      continue;
+    }
+
+    bytesRead += bytesCaptured;
+  }
+
+  Serial.printf("✓ 录音完成，实际捕获 %u / %u 字节\n",
+                static_cast<unsigned>(bytesRead), static_cast<unsigned>(targetBytes));
+
+  // 录音后卸载I2S驱动,释放资源
+  deinitMicrophoneI2S();
+  
+  return bytesRead;
+#endif
+}
+
+// ==================== 语音识别工具函数 ====================
+static String percentEncode(const String& value) {
+  const char* hex = "0123456789ABCDEF";
+  String result;
+  result.reserve(value.length() * 3);
+  for (size_t i = 0; i < value.length(); ++i) {
+    uint8_t c = static_cast<uint8_t>(value[i]);
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      result += static_cast<char>(c);
+    } else {
+      result += '%';
+      result += hex[(c >> 4) & 0x0F];
+      result += hex[c & 0x0F];
+    }
+  }
+  return result;
+}
+
+static String hmacSha1Base64(const String& key, const String& data) {
+  unsigned char hmacResult[20];
+  unsigned char base64Result[64];
+  size_t base64Len = 0;
+
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
+  if (info == nullptr) {
+    return "";
+  }
+
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  if (mbedtls_md_setup(&ctx, info, 1) != 0) {
+    mbedtls_md_free(&ctx);
+    return "";
+  }
+
+  mbedtls_md_hmac_starts(&ctx,
+                          reinterpret_cast<const unsigned char*>(key.c_str()),
+                          key.length());
+  mbedtls_md_hmac_update(&ctx,
+                          reinterpret_cast<const unsigned char*>(data.c_str()),
+                          data.length());
+  mbedtls_md_hmac_finish(&ctx, hmacResult);
+  mbedtls_md_free(&ctx);
+
+  if (mbedtls_base64_encode(base64Result, sizeof(base64Result), &base64Len, hmacResult,
+                            sizeof(hmacResult)) != 0) {
+    return "";
+  }
+  base64Result[base64Len] = '\0';
+  return String(reinterpret_cast<char*>(base64Result));
+}
+
+static String getGmtTimestamp(time_t t) {
+  struct tm timeinfo;
+  gmtime_r(&t, &timeinfo);
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  return String(buffer);
+}
+
+static String createAliyunSignatureNonce() {
+  uint32_t part1 = static_cast<uint32_t>(random(0x7FFFFFFF));
+  uint32_t part2 = static_cast<uint32_t>(millis());
+  return String(part1) + String(part2);
+}
+
+// 尝试在阿里云ASR的多层响应结构中提取识别文本
+static String extractAliyunAsrText(JsonVariantConst node) {
+  if (node.isNull()) {
+    return "";
+  }
+
+  if (node.is<const char*>()) {
+    String text = node.as<const char*>();
+    text.trim();
+    return text;
+  }
+
+  if (node.is<JsonArrayConst>()) {
+    for (JsonVariantConst child : node.as<JsonArrayConst>()) {
+      String text = extractAliyunAsrText(child);
+      if (text.length() > 0) {
+        return text;
+      }
+    }
+    return "";
+  }
+
+  if (node.is<JsonObjectConst>()) {
+    JsonObjectConst obj = node.as<JsonObjectConst>();
+
+    // 常见字段优先检查
+    const char* candidateKeys[] = {
+        "result", "text", "transcription", "transcript", "detokenized_result",
+        "payload", "data", "body", "NBest", "sentence", "Sentence", "value",
+        "best_transcription", "best_result"};
+
+    for (const char* key : candidateKeys) {
+      if (obj.containsKey(key)) {
+        String text = extractAliyunAsrText(obj[key]);
+        if (text.length() > 0) {
+          return text;
+        }
+      }
+    }
+
+    // 兜底：遍历所有字段
+    for (JsonPairConst kv : obj) {
+      String text = extractAliyunAsrText(kv.value());
+      if (text.length() > 0) {
+        return text;
+      }
+    }
+  }
+
+  return "";
+}
+
+static bool fetchAliyunTokenIfNeeded() {
+  time_t now = time(nullptr);
+  if (!aliyun_asr_token.isEmpty() && aliyun_token_expire_unix > 0) {
+    if (aliyun_token_expire_unix - now > 60) {
+      return true;
+    }
+  }
+
+  if (String(ALIYUN_ASR_ACCESS_KEY_ID).length() == 0 ||
+    String(ALIYUN_ASR_ACCESS_KEY_SECRET).length() == 0 ||
+    String(ALIYUN_ASR_APP_KEY).length() == 0) {
+    Serial.println("❌ 阿里云ASR密钥未配置，请检查 config_local.h");
+    return false;
+  }
+
+  if (now < 1000) {
+    Serial.println("❌ 系统时间尚未同步，无法生成阿里云签名");
+    return false;
+  }
+
+  String timestamp = getGmtTimestamp(now);
+  String nonce = createAliyunSignatureNonce();
+
+  std::vector<std::pair<String, String>> params = {
+      {"AccessKeyId", String(ALIYUN_ASR_ACCESS_KEY_ID)},
+      {"Action", "CreateToken"},
+      {"Format", "JSON"},
+      {"RegionId", String(ALIYUN_ASR_REGION)},
+      {"SignatureMethod", "HMAC-SHA1"},
+      {"SignatureNonce", nonce},
+      {"SignatureVersion", "1.0"},
+      {"Timestamp", timestamp},
+      {"Version", "2019-02-28"}};
+
+  std::sort(params.begin(), params.end(),
+            [](const std::pair<String, String>& a, const std::pair<String, String>& b) {
+              return a.first < b.first;
+            });
+
+  String canonicalQuery;
+  for (size_t i = 0; i < params.size(); ++i) {
+    canonicalQuery += percentEncode(params[i].first);
+    canonicalQuery += "=";
+    canonicalQuery += percentEncode(params[i].second);
+    if (i + 1 < params.size()) {
+      canonicalQuery += "&";
+    }
+  }
+
+  String stringToSign = "GET&%2F&" + percentEncode(canonicalQuery);
+  String signature = hmacSha1Base64(String(ALIYUN_ASR_ACCESS_KEY_SECRET) + "&", stringToSign);
+  if (signature.length() == 0) {
+    Serial.println("❌ 生成阿里云ASR签名失败");
+    return false;
+  }
+
+  String requestUrl = "https://nls-meta." + String(ALIYUN_ASR_REGION) +
+                      ".aliyuncs.com/?" + canonicalQuery + "&Signature=" + percentEncode(signature);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+
+  if (!http.begin(client, requestUrl)) {
+    Serial.println("❌ 初始化阿里云ASR token请求失败");
+    return false;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    Serial.printf("❌ 阿里云ASR token请求失败: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.printf("❌ 解析阿里云ASR token响应失败: %s\n", error.c_str());
+    return false;
+  }
+
+  if (!doc.containsKey("Token")) {
+    Serial.printf("❌ 阿里云ASR token响应异常: %s\n", payload.c_str());
+    return false;
+  }
+
+  aliyun_asr_token = doc["Token"]["Id"].as<String>();
+  long long expireUnix = doc["Token"]["ExpireTime"] | 0LL;
+  if (expireUnix == 0) {
+    expireUnix = now + 3600;  // 默认缓存1小时
+  }
+  aliyun_token_expire_unix = expireUnix;
+  Serial.println("✓ 阿里云ASR token获取成功");
+  return true;
+}
+
+static String recognizeSpeechWithAliyun(const uint8_t* audioData, size_t audioSize) {
+  if (!fetchAliyunTokenIfNeeded()) {
+    return "";
+  }
+
+  if (aliyun_asr_token.isEmpty()) {
+    Serial.println("❌ 阿里云ASR token为空");
+    return "";
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(30000);
+
+  String url = "https://nls-gateway-" + String(ALIYUN_ASR_REGION) +
+               ".aliyuncs.com/stream/v1/asr?appkey=" + String(ALIYUN_ASR_APP_KEY) +
+               "&format=pcm&sample_rate=" + String(MIC_SAMPLE_RATE) +
+               "&enable_punctuation_prediction=true&enable_inverse_text_normalization=true";
+
+  if (!http.begin(client, url)) {
+    Serial.println("❌ 初始化阿里云ASR请求失败");
+    return "";
+  }
+
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-NLS-Token", aliyun_asr_token);
+
+  int httpCode = http.POST(const_cast<uint8_t*>(audioData), audioSize);
+  String response = "";
+
+  if (httpCode > 0) {
+    response = http.getString();
+    Serial.printf("阿里云ASR响应码: %d\n", httpCode);
+
+    if (httpCode == 200) {
+      DynamicJsonDocument respDoc(4096);
+      DeserializationError error = deserializeJson(respDoc, response);
+      if (!error) {
+        String text = extractAliyunAsrText(respDoc.as<JsonVariantConst>());
+
+        if (text.length() > 0) {
+          text.trim();
+          Serial.printf("✓ 阿里云ASR识别结果: %s\n", text.c_str());
+          http.end();
+          return text;
+        }
+
+        if (respDoc.containsKey("error_code") || respDoc.containsKey("error_message")) {
+          Serial.printf("❌ 阿里云ASR错误: %s\n", response.c_str());
+        } else {
+          Serial.println("ℹ️ 阿里云ASR返回空结果");
+          Serial.printf("↪ 原始响应: %s\n", response.c_str());
+        }
+      } else {
+        Serial.printf("❌ 阿里云ASR JSON解析失败: %s\n", error.c_str());
+      }
+    } else {
+      Serial.printf("❌ 阿里云ASR HTTP错误: %s\n", response.c_str());
+    }
+  } else {
+    Serial.printf("❌ 阿里云ASR请求失败: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+  return "";
+}
+
+static String recognizeSpeechWithBaidu(const uint8_t* audioData, size_t audioSize) {
+  if (!fetchBaiduTokenIfNeeded()) {
+    Serial.println("❌ 无法获取百度token");
+    return "";
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(30000);
+
+  const String url = "https://vop.baidu.com/server_api";
+  if (!http.begin(client, url)) {
+    Serial.println("❌ HTTP begin失败");
+    return "";
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  String base64Audio = encodeBase64(audioData, audioSize);
+  if (base64Audio.length() == 0) {
+    Serial.println("❌ Base64编码音频失败");
+    http.end();
+    return "";
+  }
+
+  String requestBody;
+  requestBody.reserve(base64Audio.length() + 256);
+  requestBody += '{';
+  requestBody += "\"format\":\"pcm\",";
+  requestBody += "\"rate\":";
+  requestBody += String(MIC_SAMPLE_RATE);
+  requestBody += ',';
+  requestBody += "\"channel\":";
+  requestBody += String(MIC_CHANNELS);
+  requestBody += ',';
+  requestBody += "\"cuid\":\"ESP32CAM001\",";
+  requestBody += "\"token\":\"";
+  requestBody += baidu_access_token;
+  requestBody += "\",";
+  requestBody += "\"speech\":\"";
+  requestBody += base64Audio;
+  requestBody += "\",";
+  requestBody += "\"len\":";
+  requestBody += String(audioSize);
+  requestBody += '}';
+
+  Serial.printf("发送百度语音识别请求，大小: %u bytes\n", static_cast<unsigned>(requestBody.length()));
+
+  int httpCode = http.POST(requestBody);
+  String response = "";
+
+  if (httpCode > 0) {
+    response = http.getString();
+    Serial.printf("百度ASR响应码: %d\n", httpCode);
+
+    DynamicJsonDocument respDoc(4096);
+    DeserializationError error = deserializeJson(respDoc, response);
+    if (!error) {
+      if (respDoc.containsKey("result") && respDoc["result"].size() > 0) {
+        response = respDoc["result"][0].as<String>();
+        Serial.printf("✓ 百度ASR识别结果: %s\n", response.c_str());
+      } else if (respDoc.containsKey("err_msg")) {
+        Serial.printf("❌ 百度ASR错误: %s\n", respDoc["err_msg"].as<const char*>());
+        response = "";
+      }
+    } else {
+      Serial.printf("❌ 百度ASR JSON解析失败: %s\n", error.c_str());
+      response = "";
+    }
+  } else {
+    Serial.printf("❌ 百度ASR请求失败: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+  base64Audio = "";
+  requestBody = "";
+  return response;
+}
+
+// ==================== 语音识别函数 ====================
+String recognizeSpeech(const uint8_t* audioData, size_t audioSize) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi未连接，无法进行语音识别");
+    return "";
+  }
+
+  if (audioSize == 0) {
+    Serial.println("⚠️ 音频长度为0，跳过语音识别");
+    return "";
+  }
+
+  Serial.printf("🎙️ 开始语音识别，音频长度: %u 字节\n", static_cast<unsigned>(audioSize));
+
+  if (ASR_PROVIDER == ASR_PROVIDER_ALIYUN) {
+    return recognizeSpeechWithAliyun(audioData, audioSize);
+  }
+
+  Serial.println("❌ 当前ASR提供商未实现，请检查配置");
+  return "";
+}
+
+// ==================== 生成提示词 ====================
+String generatePromptFromSpeech(String speechText) {
+  Serial.printf("💡 生成提示词基于语音: %s\n", speechText.c_str());
+  
+  // 简单处理：将语音识别结果作为视觉AI的提示词
+  // 可以根据需要扩展为更复杂的逻辑
+  if (speechText.length() == 0) {
+    return VISION_PROMPT; // 默认提示词
+  }
+  
+  // 直接使用用户的语音命令作为提示词,让AI根据用户的命令分析图片
+  String customPrompt = "用户命令：" + speechText + "\n\n请根据用户的命令结合当前图片，针对该命令做出反应";
+  return customPrompt;
+}
+
+// ==================== 语音唤醒监听 ====================
+bool listenForWakeWord(const String& targetWord, unsigned long timeoutMs) {
+#if !ENABLE_MICROPHONE
+  Serial.println("❌ [唤醒] 语音唤醒功能已禁用(ENABLE_MICROPHONE=0)");
+  return false;
+#else
+  if (targetWord.isEmpty()) {
+    Serial.println("❌ [唤醒] 唤醒词为空，跳过监听");
+    return false;
+  }
+
+  const size_t wakeBufferSize = WAKE_WORD_BUFFER_BYTES;
+  uint8_t* audioBuffer = (uint8_t*)malloc(wakeBufferSize);
+  if (!audioBuffer) {
+    Serial.println("❌ [唤醒] 分配监听缓冲区失败");
+    return false;
+  }
+
+  Serial.printf("👂 [唤醒] 进入语音唤醒模式，唤醒词: %s\n", targetWord.c_str());
+  Serial.printf("👂 [唤醒] 每次监听 %d 秒，超时时间: %lu ms\n", WAKE_LISTEN_SECONDS, timeoutMs);
+
+  unsigned long start = millis();
+  int attempt = 1;
+  bool detected = false;
+
+  String normalizedWake = targetWord;
+  normalizedWake.toLowerCase();
+
+  while (true) {
+    if (timeoutMs > 0 && (millis() - start) > timeoutMs) {
+      Serial.println("⌛ [唤醒] 超时，未检测到唤醒词");
+      break;
+    }
+
+    Serial.printf("🎧 [唤醒] 第 %d 次监听...\n", attempt);
+    size_t recordedBytes = recordAudio(audioBuffer, wakeBufferSize, WAKE_LISTEN_SECONDS);
+    if (recordedBytes == 0) {
+      Serial.println("⚠️ [唤醒] 本次录音失败或无数据");
+      break;  // 录音失败直接退出,不再继续
+    }
+
+    String speechText = recognizeSpeech(audioBuffer, recordedBytes);
+    if (speechText.isEmpty()) {
+      Serial.println("ℹ️ [唤醒] 未识别到有效语音，继续监听");
+      attempt++;
+      continue;
+    }
+
+    Serial.printf("🗣️ [唤醒] 识别内容: %s\n", speechText.c_str());
+
+    String normalizedSpeech = speechText;
+    normalizedSpeech.toLowerCase();
+    if (normalizedSpeech.indexOf(normalizedWake) != -1) {
+      Serial.println("✅ [唤醒] 检测到唤醒词！");
+      detected = true;
+      break;
+    }
+
+    attempt++;
+  }
+
+  free(audioBuffer);
+  return detected;
+#endif
+}
+
+bool performVoiceWakeFlow() {
+#if !ENABLE_MICROPHONE
+  Serial.println("❌ 语音唤醒功能已禁用(ENABLE_MICROPHONE=0)");
+  Serial.println("ℹ️ 如需启用,请修改代码中的 ENABLE_MICROPHONE 为 1");
+  return false;
+#else
+  Serial.println("\n\n****************************************");
+  Serial.println("*     进入语音唤醒流程                 *");
+  Serial.println("****************************************\n");
+
+  bool wakeDetected = listenForWakeWord(wakeWord, WAKE_TIMEOUT_MS);
+  if (!wakeDetected) {
+    Serial.println("❌ [唤醒] 未检测到唤醒词，退出语音唤醒流程");
+    return false;
+  }
+
+  playBeepTone(880, 180);
+  delay(250);
+  Serial.println("🎯 [唤醒] 唤醒成功，请在提示音后说出指令...");
+  delay(300);
+  bool analysisOk = performVoiceAnalysis();
+  if (!analysisOk) {
+    Serial.println("❌ [唤醒] 语音唤醒后分析失败");
+  }
+  return analysisOk;
+#endif
+}
+
+// ==================== 执行语音输入分析流程 ====================
+bool performVoiceAnalysis() {
+  Serial.println("\n\n****************************************");
+  Serial.println("*     开始执行语音输入分析流程         *");
+  Serial.println("****************************************\n");
+  
+  unsigned long startTime = millis();
+  
+  // 1. 录音
+  Serial.printf("🎤 [步骤 1/4] 录音 %d 秒指令...\n", VOICE_COMMAND_SECONDS);
+  const size_t voiceBufferSize = VOICE_COMMAND_BUFFER_BYTES;
+  uint8_t* audioBuffer = (uint8_t*)malloc(voiceBufferSize);
+  if (!audioBuffer) {
+    Serial.println("❌ 内存分配失败");
+    return false;
+  }
+  
+  size_t recordedBytes = recordAudio(audioBuffer, voiceBufferSize, VOICE_COMMAND_SECONDS);
+  if (recordedBytes == 0) {
+    Serial.println("❌ 录音失败");
+    free(audioBuffer);
+    return false;
+  }
+  
+  // 2. 语音识别
+  Serial.println("\n🎙️ [步骤 2/4] 语音识别...");
+  String speechText = recognizeSpeech(audioBuffer, recordedBytes);
+  free(audioBuffer); // 释放录音缓冲区
+  
+  if (speechText.length() == 0) {
+    Serial.println("❌ 语音识别失败");
+    return false;
+  }
+  
+  // 3. 生成提示词并拍照分析
+  Serial.println("\n💡 [步骤 3/4] 生成提示词并拍照分析...");
+  String customPrompt = generatePromptFromSpeech(speechText);
+  
+  // 临时修改VISION_PROMPT
+  const char* originalPrompt = VISION_PROMPT;
+  VISION_PROMPT = customPrompt.c_str();
+  
+  // 执行视觉分析
+  performVisionAnalysis();
+  
+  // 恢复原始提示词
+  VISION_PROMPT = originalPrompt;
+  
+  // 4. 输出语音识别结果
+  Serial.println("\n📝 [步骤 4/4] 输出语音识别结果...");
+  outputToSerial("语音识别结果: " + speechText);
+  
+  unsigned long totalTime = millis() - startTime;
+  Serial.println("\n****************************************");
+  Serial.printf("*  语音分析流程完成！总耗时: %lu ms (%.1f 秒) *\n", totalTime, totalTime / 1000.0);
+  Serial.println("****************************************\n");
+  return true;
 }
 
 static esp_err_t jpg_handler(httpd_req_t* req) {
@@ -512,6 +1327,8 @@ static esp_err_t index_handler(httpd_req_t* req) {
         </div>
         <div class="controls">
           <button class="btn-warning" onclick="aiAnalyze()">🤖 AI分析</button>
+          <button class="btn-info" onclick="voiceAnalyze()">🎤 语音分析</button>
+          <button class="btn-info" onclick="voiceWake()">🛎️ 语音唤醒</button>
           <button class="btn-info" onclick="testBeep()">🔊 测试扬声器</button>
           <button class="btn-info" onclick="location.reload()">🔄 刷新</button>
         </div>
@@ -643,7 +1460,53 @@ static esp_err_t index_handler(httpd_req_t* req) {
         });
     }
 
-    updateStatus('💡 提示：先点击"开始视频流"查看画面，然后点击"AI分析"识别图像');
+    function voiceAnalyze() {
+      updateStatus('<span class="loading"></span>🎤 语音分析中，请说话...（预计10-20秒）', 'analyzing');
+      aiResult.innerHTML = '⏳ 语音分析中...\n\n步骤：\n🎤 正在录音...\n🎙️ 正在语音识别...\n💡 生成提示词...\n🤖 调用视觉AI...\n✅ 准备显示结果...';
+
+      fetch('/voice_analyze')
+        .then(response => response.json())
+        .then(data => {
+          if (data.success) {
+            aiResult.innerHTML = '✅ 语音分析完成\n\n' + data.message;
+            updateStatus('✅ 语音分析完成！', 'success');
+            setTimeout(() => updateStatus('系统就绪'), 5000);
+          } else {
+            aiResult.innerHTML = '❌ 语音分析失败\n\n错误信息：' + data.error;
+            updateStatus('❌ 语音分析失败: ' + data.error, 'error');
+          }
+        })
+        .catch(err => {
+          aiResult.innerHTML = '❌ 网络错误\n\n' + err.message;
+          updateStatus('❌ 请求失败: ' + err.message, 'error');
+          console.error('语音分析错误:', err);
+        });
+    }
+
+    function voiceWake() {
+      updateStatus('<span class="loading"></span>�️ 语音唤醒模式激活中，请说出唤醒词...（最长45秒）', 'analyzing');
+      aiResult.innerHTML = '⏳ 语音唤醒中...\n\n步骤：\n👂 监听唤醒词...\n🎧 检测成功后提示音...\n🎤 再次录音识别指令...\n🤖 调用视觉AI...\n🔊 扬声器播报结果...';
+
+      fetch('/voice_wake')
+        .then(response => response.json())
+        .then(data => {
+          if (data.success) {
+            aiResult.innerHTML = '✅ 语音唤醒完成\n\n' + data.message;
+            updateStatus('✅ 语音唤醒完成！', 'success');
+            setTimeout(() => updateStatus('系统就绪'), 5000);
+          } else {
+            aiResult.innerHTML = '❌ 语音唤醒失败\n\n错误信息：' + data.error;
+            updateStatus('❌ 语音唤醒失败: ' + data.error, 'error');
+          }
+        })
+        .catch(err => {
+          aiResult.innerHTML = '❌ 网络错误\n\n' + err.message;
+          updateStatus('❌ 请求失败: ' + err.message, 'error');
+          console.error('语音唤醒错误:', err);
+        });
+    }
+
+    updateStatus('�💡 提示：先点击"开始视频流"查看画面，然后点击"AI分析"、"语音分析"或"语音唤醒"体验不同模式');
   </script>
 </body>
 </html>
@@ -838,7 +1701,6 @@ void outputToSerial(String aiResponse) {
 
 bool requestAndPlayTTS(const String& text);
 bool playMP3StreamFromURL(const String& url);
-bool playBeepTone(int freqHz = 600, int durationMs = 500);
 
 // helper: split long text into chunks (tries to split at punctuation or space)
 std::vector<String> splitTextIntoChunks(const String &text, size_t maxLen) {
@@ -877,20 +1739,17 @@ using TTSChunkFunc = std::function<bool(const String&)>;
 // Play text by splitting into chunks and calling the chunk handler sequentially
 bool playTextInChunks(const TTSChunkFunc &chunkFunc, const String &text, size_t maxLen) {
   std::vector<String> chunks = splitTextIntoChunks(text, maxLen);
-  bool anyOk = false;
-  for (size_t i = 0; i < chunks.size(); ++i) {
-    Serial.printf("ℹ️ [TTS] 播放第 %d/%d 段，长度=%d\n", (int)(i+1), (int)chunks.size(), chunks[i].length());
-    bool ok = chunkFunc(chunks[i]);
-    if (!ok) {
-      Serial.printf("✗ [TTS] 第 %d 段播放失败\n", (int)(i+1));
-      // continue to next chunk to try to play remaining text
-    } else {
-      anyOk = true;
-    }
-    // 增加间隔，确保硬件与流资源完全释放，避免重建过快导致噪音或重复
-    delay(500);
+  if (chunks.empty()) {
+    Serial.println(F("⚠️ [TTS] 分段结果为空，无法播放"));
+    return false;
   }
-  return anyOk;
+
+  Serial.printf("ℹ️ [TTS] 播放单段文本，长度=%d\n", chunks[0].length());
+  bool ok = chunkFunc(chunks[0]);
+  if (!ok) {
+    Serial.println(F("✗ [TTS] 单段播放失败"));
+  }
+  return ok;
 }
 
 void speakText(String text) {
@@ -1194,27 +2053,6 @@ bool playMP3StreamFromURL(const String& url) {
     Serial.println(F("❌ [TTS] 音频播放失败"));
   }
 
-  // 如果流播放失败，则尝试下载到 SPIFFS 再播放（回退方案）
-  if (!success) {
-    Serial.println(F("↪ [TTS] 流播放失败，尝试回退：下载到 SPIFFS 并播放本地文件"));
-    String tmpPath = String("/tts_tmp_") + String(millis()) + String(".mp3");
-    if (downloadMP3ToSPIFFS(reqUrl, tmpPath)) {
-      bool localOk = playMP3FromSPIFFS(tmpPath);
-      // 删除临时文件
-      if (SPIFFS.exists(tmpPath)) {
-        SPIFFS.remove(tmpPath);
-      }
-      if (localOk) {
-        Serial.println(F("✅ [TTS] 回退播放成功 (SPIFFS)"));
-        success = true;
-      } else {
-        Serial.println(F("✗ [TTS] 回退播放失败 (SPIFFS)"));
-      }
-    } else {
-      Serial.println(F("✗ [TTS] 下载到 SPIFFS 失败，无法回退播放"));
-    }
-  }
-
   return success;
 }
 
@@ -1504,21 +2342,47 @@ void performVisionAnalysis() {
 
 // ==================== 检测按钮触发 ====================
 void checkButtonTrigger() {
+  // 视觉分析按钮
   int reading = digitalRead(TRIGGER_BUTTON_PIN);
-  
-  // 防抖处理
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
   }
-  
   if ((millis() - lastDebounceTime) > debounceDelay) {
     if (reading == LOW && lastButtonState == HIGH) {
       Serial.println("\n🔘 按钮触发：开始拍照分析");
       performVisionAnalysis();
     }
   }
-  
   lastButtonState = reading;
+  
+  // 语音输入按钮
+  int voiceReading = digitalRead(VOICE_BUTTON_PIN);
+  if (voiceReading != lastVoiceButtonState) {
+    lastVoiceDebounceTime = millis();
+  }
+  if ((millis() - lastVoiceDebounceTime) > debounceDelay) {
+    if (voiceReading == LOW && lastVoiceButtonState == HIGH) {
+      voiceButtonPressStart = millis();
+      Serial.println("\n🎤 语音按钮按下");
+    }
+    if (voiceReading == HIGH && lastVoiceButtonState == LOW) {
+      unsigned long pressDuration = millis() - voiceButtonPressStart;
+      if (pressDuration >= 1500) {
+        Serial.println("\n🎤 长按触发：进入语音唤醒模式");
+        bool wakeOk = performVoiceWakeFlow();
+        if (!wakeOk) {
+          Serial.println("⚠️ 语音唤醒流程未完成或失败");
+        }
+      } else {
+        Serial.println("\n🎤 短按触发：直接语音分析");
+        bool voiceOk = performVoiceAnalysis();
+        if (!voiceOk) {
+          Serial.println("⚠️ 语音分析失败，请重试");
+        }
+      }
+    }
+  }
+  lastVoiceButtonState = voiceReading;
 }
 
 // ==================== HTTP处理 - AI分析 ====================
@@ -1609,6 +2473,50 @@ static esp_err_t beep_handler(httpd_req_t *req) {
   return httpd_resp_send(req, response_json, strlen(response_json));
 }
 
+// ==================== HTTP处理 - 语音分析 ====================
+static esp_err_t voice_analyze_handler(httpd_req_t *req){
+  Serial.println("\n🌐 Web触发：语音分析请求");
+  
+  // 执行语音分析
+  bool success = performVoiceAnalysis();
+
+  DynamicJsonDocument doc(256);
+  doc["success"] = success;
+  if (success) {
+    doc["message"] = "语音分析完成";
+  } else {
+    doc["error"] = "语音分析失败，请重试";
+  }
+
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, jsonResponse.c_str(), jsonResponse.length());
+}
+
+static esp_err_t voice_wake_handler(httpd_req_t *req) {
+  Serial.println("\n🌐 Web触发：语音唤醒请求");
+
+  bool success = performVoiceWakeFlow();
+
+  DynamicJsonDocument doc(256);
+  doc["success"] = success;
+  if (success) {
+    doc["message"] = "语音唤醒完成";
+  } else {
+    doc["error"] = "未检测到唤醒词或分析失败";
+  }
+
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, jsonResponse.c_str(), jsonResponse.length());
+}
+
 // 启动Web服务器
 void startCameraServer(){
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1651,13 +2559,29 @@ void startCameraServer(){
     .handler   = beep_handler,
     .user_ctx  = NULL
   };
+
+  httpd_uri_t voice_analyze_uri = {
+    .uri       = "/voice_analyze",
+    .method    = HTTP_GET,
+    .handler   = voice_analyze_handler,
+    .user_ctx  = NULL
+  };
+
+  httpd_uri_t voice_wake_uri = {
+    .uri       = "/voice_wake",
+    .method    = HTTP_GET,
+    .handler   = voice_wake_handler,
+    .user_ctx  = NULL
+  };
   
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     httpd_register_uri_handler(camera_httpd, &stream_uri);
     httpd_register_uri_handler(camera_httpd, &ai_analyze_uri);
-  httpd_register_uri_handler(camera_httpd, &beep_uri);
+    httpd_register_uri_handler(camera_httpd, &beep_uri);
+    httpd_register_uri_handler(camera_httpd, &voice_analyze_uri);
+    httpd_register_uri_handler(camera_httpd, &voice_wake_uri);
     Serial.println("HTTP服务器启动成功");
   } else {
     Serial.println("HTTP服务器启动失败");
@@ -1691,11 +2615,17 @@ void setup() {
   
   // 配置触发按钮
   pinMode(TRIGGER_BUTTON_PIN, INPUT_PULLUP);
-  Serial.printf("✓ 触发按钮配置在 GPIO%d\n", TRIGGER_BUTTON_PIN);
+  pinMode(VOICE_BUTTON_PIN, INPUT_PULLUP);
+  Serial.printf("✓ 触发按钮配置在 GPIO%d (视觉)\n", TRIGGER_BUTTON_PIN);
+  Serial.printf("✓ 语音按钮配置在 GPIO%d (语音)\n", VOICE_BUTTON_PIN);
   
   // 初始化摄像头
-  Serial.println("\n[1/3] 初始化摄像头...");
+  Serial.println("\n[1/4] 初始化摄像头...");
   setupCamera();
+  
+  // 初始化麦克风
+  Serial.println("\n[2/4] 初始化麦克风...");
+  setupMicrophone();
 
   // 初始化 SPIFFS（用于 TTS 临时缓存）
   Serial.println("\n[?] 尝试挂载 SPIFFS 用于 TTS 缓存...");
@@ -1706,7 +2636,7 @@ void setup() {
   }
   
   // 连接WiFi
-  Serial.println("\n[2/3] 连接WiFi...");
+  Serial.println("\n[3/4] 连接WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
@@ -1747,7 +2677,7 @@ void setup() {
     }
     
   // 启动HTTP服务器
-  Serial.println("\n[3/3] 启动Web服务器...");
+  Serial.println("\n[4/4] 启动Web服务器...");
     startCameraServer();
     
     Serial.println("\n╔══════════════════════════════════════╗");
